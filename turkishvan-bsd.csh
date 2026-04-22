@@ -70,8 +70,8 @@ set XORG_BIN = ""
 set GNUSTEP_ENV = ""
 set XKB_RULES_FILE = ""
 
-alias log_msg 'set _ts=`date -u "+%Y-%m-%dT%H:%M:%SZ"`; set _line="${_ts} \!:1 \!:2 \!:3 \!:4*"; /bin/echo "${_line}"; if ( $?LOG_FILE ) /bin/echo "${_line}" >>! "${LOG_FILE}"'
-alias mark_checkpoint 'if ( ! -e "${CHECKPOINT_FILE}" ) /usr/bin/touch "${CHECKPOINT_FILE}"; grep -qx "\!:1" "${CHECKPOINT_FILE}" >/dev/null 2>&1; if ( $status != 0 ) /bin/echo "\!:1" >>! "${CHECKPOINT_FILE}"'
+alias log_msg 'set _ts = `date -u "+%Y-%m-%dT%H:%M:%SZ"`; /bin/echo "${_ts} \!:1 \!:2 \!:3 \!:4"; /bin/echo "${_ts} \!:1 \!:2 \!:3 \!:4" >>! "${LOG_FILE}"'
+alias mark_checkpoint '/usr/bin/touch "${CHECKPOINT_FILE}"; grep -qx "\!:1" "${CHECKPOINT_FILE}" >/dev/null 2>&1; if ( $status != 0 ) /bin/echo "\!:1" >>! "${CHECKPOINT_FILE}"'
 
 #
 # argument parsing
