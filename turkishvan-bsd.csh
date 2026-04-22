@@ -1,5 +1,5 @@
 #!/bin/csh -f
-# csh-only provisioning and convergence for DragonFlyBSD desktop use
+# turkishvan-bsd.csh
 
 umask 022
 set path = ( /usr/local/sbin /usr/local/bin /sbin /bin /usr/sbin /usr/bin )
@@ -70,8 +70,9 @@ set XORG_BIN = ""
 set GNUSTEP_ENV = ""
 set XKB_RULES_FILE = ""
 
-alias log_msg 'set _ts = `date -u "+%Y-%m-%dT%H:%M:%SZ"`; /bin/echo "${_ts} \!:1 \!:2 \!:3 \!:4"; /bin/echo "${_ts} \!:1 \!:2 \!:3 \!:4" >>! "${LOG_FILE}"'
-alias mark_checkpoint '/usr/bin/touch "${CHECKPOINT_FILE}"; grep -qx "\!:1" "${CHECKPOINT_FILE}" >/dev/null 2>&1; if ( $status != 0 ) /bin/echo "\!:1" >>! "${CHECKPOINT_FILE}"'
+set LOG_HELPER = "${STATE_DIR}/log-msg.csh"
+set CHECKPOINT_HELPER = "${STATE_DIR}/mark-checkpoint.csh"
+
 
 #
 # argument parsing
@@ -150,6 +151,29 @@ if ( ! -e "${CHECKPOINT_FILE}" ) /usr/bin/touch "${CHECKPOINT_FILE}"
 if ( ! -e "${CHANGE_MANIFEST}" ) /usr/bin/touch "${CHANGE_MANIFEST}"
 if ( ! -e "${ROLLBACK_MANIFEST}" ) /usr/bin/touch "${ROLLBACK_MANIFEST}"
 
+cat >! "${LOG_HELPER}" <<'TVB_LOG_EOF'
+#!/bin/csh -f
+if ( $#argv < 2 ) exit 1
+set _logfile = "$1"
+shift
+set _ts = `date -u "+%Y-%m-%dT%H:%M:%SZ"`
+set _msg = "$*"
+/bin/echo "${_ts} ${_msg}"
+/bin/echo "${_ts} ${_msg}" >>! "${_logfile}"
+TVB_LOG_EOF
+chmod 0755 "${LOG_HELPER}"
+
+cat >! "${CHECKPOINT_HELPER}" <<'TVB_CP_EOF'
+#!/bin/csh -f
+if ( $#argv < 2 ) exit 1
+set _cp = "$1"
+set _name = "$2"
+/usr/bin/touch "${_cp}"
+grep -qx "${_name}" "${_cp}" >/dev/null 2>&1
+if ( $status != 0 ) /bin/echo "${_name}" >>! "${_cp}"
+TVB_CP_EOF
+chmod 0755 "${CHECKPOINT_HELPER}"
+
 cat >! "${MERGE_AWK}" <<'AWK_EOF'
 BEGIN {
     begin = ENVIRON["TVB_BEGIN"]
@@ -187,7 +211,7 @@ if ( $status != 0 ) then
     exit ${EXIT_CODE_INTERNAL}
 endif
 
-log_msg INFO phase0 start "initializing logging, state directories, and lock"
+/bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase0 start "initializing logging, state directories, and lock"
 
 if ( -e "${LOCK_FILE}" ) then
     set LOCK_PID = `awk -F= '/^pid=/{print $2}' "${LOCK_FILE}" 2>/dev/null`
@@ -195,13 +219,13 @@ if ( -e "${LOCK_FILE}" ) then
     if ( "$LOCK_PID" != "" && "$LOCK_HOST" == "${HOSTNAME_SHORT}" ) then
         kill -0 "${LOCK_PID}" >& /dev/null
         if ( $status == 0 ) then
-            log_msg ERROR phase0 lock "active lock held by pid ${LOCK_PID} on ${LOCK_HOST}"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase0 lock "active lock held by pid ${LOCK_PID} on ${LOCK_HOST}"
             set EXIT_CODE = ${EXIT_CODE_LOCK}
             goto CLEAN_EXIT
         endif
     endif
     /bin/mv -f "${LOCK_FILE}" "${LOCK_FILE}.stale.${RUN_ID}" >& /dev/null
-    log_msg WARN phase0 lock "stale lock detected and rotated"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN phase0 lock "stale lock detected and rotated"
 endif
 
 set LOCK_TMP = `mktemp "${STATE_DIR}/run.lock.XXXXXX"`
@@ -214,13 +238,13 @@ script=${SCRIPT_NAME}
 EOF
 /bin/mv -f "${LOCK_TMP}" "${LOCK_FILE}"
 if ( $status != 0 ) then
-    log_msg ERROR phase0 lock "failed to acquire lock file ${LOCK_FILE}"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase0 lock "failed to acquire lock file ${LOCK_FILE}"
     set EXIT_CODE = ${EXIT_CODE_LOCK}
     goto CLEAN_EXIT
 endif
 
-log_msg OK phase0 lock "lock acquired"
-log_msg INFO phase0 args "username=${TARGET_USER} keyboard=${KEYBOARD_LAYOUT} resume=${RESUME} force=${FORCE} activate_now=${ACTIVATE_NOW} skip_upgrade=${SKIP_UPGRADE}"
+/bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase0 lock "lock acquired"
+/bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase0 args "username=${TARGET_USER} keyboard=${KEYBOARD_LAYOUT} resume=${RESUME} force=${FORCE} activate_now=${ACTIVATE_NOW} skip_upgrade=${SKIP_UPGRADE}"
 
 #
 # phase 1: preflight validation
@@ -233,62 +257,62 @@ if ( -e "${CHECKPOINT_FILE}" && ${FORCE} == 0 ) then
 endif
 
 if ( ${SKIP_PHASE} == 1 ) then
-    log_msg SKIP phase1 resume "checkpoint already completed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase1 resume "checkpoint already completed"
 else
-    log_msg INFO phase1 start "running platform and input validation"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase1 start "running platform and input validation"
 
     set OS_NAME = `uname -s 2>/dev/null`
     if ( "$OS_NAME" != "DragonFly" ) then
-        log_msg ERROR phase1 detect-os "uname -s returned ${OS_NAME}; DragonFly required"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase1 detect-os "uname -s returned ${OS_NAME}; DragonFly required"
         set EXIT_CODE = ${EXIT_CODE_PLATFORM}
         goto CLEAN_EXIT
     endif
-    log_msg OK phase1 detect-os "DragonFlyBSD confirmed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase1 detect-os "DragonFlyBSD confirmed"
 
     set EXEC_SHELL = `ps -p $$ -o comm= 2>/dev/null | awk '{print $1}' | sed 's#^.*/##'`
     if ( "$EXEC_SHELL" == "" ) set EXEC_SHELL = "unknown"
     if ( "$EXEC_SHELL" != "csh" ) then
-        log_msg ERROR phase1 detect-shell "executing shell is ${EXEC_SHELL}; csh required"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase1 detect-shell "executing shell is ${EXEC_SHELL}; csh required"
         set EXIT_CODE = ${EXIT_CODE_PLATFORM}
         goto CLEAN_EXIT
     endif
-    log_msg OK phase1 detect-shell "csh confirmed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase1 detect-shell "csh confirmed"
 
     set CURRENT_UID = `id -u 2>/dev/null`
     if ( "$CURRENT_UID" != "0" ) then
-        log_msg ERROR phase1 detect-root "root privileges required"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase1 detect-root "root privileges required"
         set EXIT_CODE = ${EXIT_CODE_PLATFORM}
         goto CLEAN_EXIT
     endif
-    log_msg OK phase1 detect-root "root privileges confirmed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase1 detect-root "root privileges confirmed"
 
     id "${TARGET_USER}" >/dev/null 2>&1
     if ( $status != 0 ) then
-        log_msg ERROR phase1 validate-user "user ${TARGET_USER} does not exist"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase1 validate-user "user ${TARGET_USER} does not exist"
         set EXIT_CODE = ${EXIT_CODE_PLATFORM}
         goto CLEAN_EXIT
     endif
 
     if ( "${TARGET_USER}" == "root" ) then
-        log_msg ERROR phase1 validate-user "target user must not be root"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase1 validate-user "target user must not be root"
         set EXIT_CODE = ${EXIT_CODE_PLATFORM}
         goto CLEAN_EXIT
     endif
 
     set TARGET_HOME = `awk -F: -v u="${TARGET_USER}" '$1==u{print $6}' /etc/passwd`
     if ( "$TARGET_HOME" == "" ) then
-        log_msg ERROR phase1 validate-user "failed to resolve home directory for ${TARGET_USER}"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase1 validate-user "failed to resolve home directory for ${TARGET_USER}"
         set EXIT_CODE = ${EXIT_CODE_PLATFORM}
         goto CLEAN_EXIT
     endif
     if ( ! -d "${TARGET_HOME}" ) then
-        log_msg ERROR phase1 validate-user "home directory ${TARGET_HOME} does not exist"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase1 validate-user "home directory ${TARGET_HOME} does not exist"
         set EXIT_CODE = ${EXIT_CODE_PLATFORM}
         goto CLEAN_EXIT
     endif
     set TARGET_GROUP = `id -gn "${TARGET_USER}" 2>/dev/null`
     if ( "$TARGET_GROUP" == "" ) set TARGET_GROUP = "${TARGET_USER}"
-    log_msg OK phase1 validate-user "user ${TARGET_USER} with home ${TARGET_HOME} confirmed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase1 validate-user "user ${TARGET_USER} with home ${TARGET_HOME} confirmed"
 
     foreach PKG_CANDIDATE ( /usr/local/sbin/pkg /usr/sbin/pkg /usr/bin/pkg )
         if ( -x "${PKG_CANDIDATE}" ) set PKG_BIN = "${PKG_CANDIDATE}"
@@ -298,24 +322,24 @@ else
         set PKG_BIN = `which pkg 2>/dev/null`
     endif
     if ( "$PKG_BIN" == "" ) then
-        log_msg ERROR phase1 validate-pkg "pkg command not found and not bootstrap-capable"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase1 validate-pkg "pkg command not found and not bootstrap-capable"
         set EXIT_CODE = ${EXIT_CODE_PLATFORM}
         goto CLEAN_EXIT
     endif
-    log_msg OK phase1 validate-pkg "pkg command available at ${PKG_BIN}"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase1 validate-pkg "pkg command available at ${PKG_BIN}"
 
     foreach CMD ( awk sed grep cp mv cmp mkdir mktemp find date hostname uname id sysctl kldstat pciconf pw )
         which "${CMD}" >/dev/null 2>&1
         if ( $status != 0 ) then
-            log_msg ERROR phase1 validate-cmd "required command ${CMD} is missing"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase1 validate-cmd "required command ${CMD} is missing"
             set EXIT_CODE = ${EXIT_CODE_PLATFORM}
             goto CLEAN_EXIT
         endif
     end
-    log_msg OK phase1 validate-cmd "essential command set available"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase1 validate-cmd "essential command set available"
 
     if ( "${KEYBOARD_LAYOUT}" !~ [A-Za-z0-9_-]* ) then
-        log_msg ERROR phase1 validate-keyboard "keyboard layout ${KEYBOARD_LAYOUT} contains invalid characters"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase1 validate-keyboard "keyboard layout ${KEYBOARD_LAYOUT} contains invalid characters"
         set EXIT_CODE = ${EXIT_CODE_PLATFORM}
         goto CLEAN_EXIT
     endif
@@ -340,19 +364,19 @@ else
             if ( "${KEYBOARD_LAYOUT}" == "${BUILTIN_LAYOUT}" ) set KEYBOARD_VALID = 1
         end
         if ( ${KEYBOARD_VALID} == 1 ) then
-            log_msg WARN phase1 validate-keyboard "xkb rules file not yet present; accepted ${KEYBOARD_LAYOUT} via conservative fallback list"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN phase1 validate-keyboard "xkb rules file not yet present; accepted ${KEYBOARD_LAYOUT} via conservative fallback list"
         endif
     endif
 
     if ( ${KEYBOARD_VALID} == 0 ) then
-        log_msg ERROR phase1 validate-keyboard "keyboard layout ${KEYBOARD_LAYOUT} is not valid"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase1 validate-keyboard "keyboard layout ${KEYBOARD_LAYOUT} is not valid"
         set EXIT_CODE = ${EXIT_CODE_VALIDATE}
         goto CLEAN_EXIT
     endif
-    log_msg OK phase1 validate-keyboard "keyboard layout ${KEYBOARD_LAYOUT} accepted"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase1 validate-keyboard "keyboard layout ${KEYBOARD_LAYOUT} accepted"
 
-    mark_checkpoint phase1
-    log_msg OK phase1 end "preflight validation completed"
+    /bin/csh "${CHECKPOINT_HELPER}" "${CHECKPOINT_FILE}" phase1
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase1 end "preflight validation completed"
 endif
 
 #
@@ -366,9 +390,9 @@ if ( -e "${CHECKPOINT_FILE}" && ${FORCE} == 0 ) then
 endif
 
 if ( ${SKIP_PHASE} == 1 ) then
-    log_msg SKIP phase2 resume "checkpoint already completed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase2 resume "checkpoint already completed"
 else
-    log_msg INFO phase2 start "collecting discovery snapshots"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase2 start "collecting discovery snapshots"
 
     cat >! "${HARDWARE_SNAPSHOT}" <<EOF
 run_id=${RUN_ID}
@@ -424,8 +448,8 @@ EOF
         endif
     end
 
-    mark_checkpoint phase2
-    log_msg OK phase2 end "discovery snapshot completed"
+    /bin/csh "${CHECKPOINT_HELPER}" "${CHECKPOINT_FILE}" phase2
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase2 end "discovery snapshot completed"
 endif
 
 #
@@ -439,9 +463,9 @@ if ( -e "${CHECKPOINT_FILE}" && ${FORCE} == 0 ) then
 endif
 
 if ( ${SKIP_PHASE} == 1 ) then
-    log_msg SKIP phase3 resume "checkpoint already completed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase3 resume "checkpoint already completed"
 else
-    log_msg INFO phase3 start "applying conservative runtime tuning"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase3 start "applying conservative runtime tuning"
 
     set SYSCTL_LINES = ()
     set AUDIO_PLAN_TMP = `mktemp "${STATE_DIR}/audio-plan.XXXXXX"`
@@ -513,36 +537,36 @@ EOF
         if ( "${CURRENT_SYSCONS_ASYNC}" != "1" ) then
             sysctl kern.syscons_async=1 >/dev/null 2>&1
             if ( $status == 0 ) then
-                log_msg OK phase3 runtime-sysctl "set kern.syscons_async=1"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase3 runtime-sysctl "set kern.syscons_async=1"
             else
-                log_msg WARN phase3 runtime-sysctl "failed to set kern.syscons_async=1 at runtime"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN phase3 runtime-sysctl "failed to set kern.syscons_async=1 at runtime"
             endif
         else
-            log_msg SKIP phase3 runtime-sysctl "kern.syscons_async already set to 1"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase3 runtime-sysctl "kern.syscons_async already set to 1"
         endif
         set SYSCTL_LINES = ( ${SYSCTL_LINES} "kern.syscons_async=1" )
     else
-        log_msg SKIP phase3 runtime-sysctl "kern.syscons_async not present on this system"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase3 runtime-sysctl "kern.syscons_async not present on this system"
     endif
 
     set CURRENT_DEFAULT_AUDIO = `sysctl -n hw.snd.default_unit 2>/dev/null`
     if ( "${SELECTED_AUDIO_UNIT}" != "" && ${AUDIO_COUNT} > 1 ) then
         sysctl hw.snd.default_unit="${SELECTED_AUDIO_UNIT}" >/dev/null 2>&1
         if ( $status == 0 ) then
-            log_msg OK phase3 runtime-audio "set hw.snd.default_unit=${SELECTED_AUDIO_UNIT} based on detected desktop output"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase3 runtime-audio "set hw.snd.default_unit=${SELECTED_AUDIO_UNIT} based on detected desktop output"
         else
-            log_msg WARN phase3 runtime-audio "failed to set hw.snd.default_unit=${SELECTED_AUDIO_UNIT} at runtime"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN phase3 runtime-audio "failed to set hw.snd.default_unit=${SELECTED_AUDIO_UNIT} at runtime"
         endif
         set SYSCTL_LINES = ( ${SYSCTL_LINES} "hw.snd.default_unit=${SELECTED_AUDIO_UNIT}" )
     else if ( "${CURRENT_DEFAULT_AUDIO}" != "" ) then
         if ( "${SELECTED_AUDIO_UNIT}" != "" ) then
             set SYSCTL_LINES = ( ${SYSCTL_LINES} "hw.snd.default_unit=${CURRENT_DEFAULT_AUDIO}" )
-            log_msg INFO phase3 runtime-audio "retaining existing default audio unit ${CURRENT_DEFAULT_AUDIO}"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase3 runtime-audio "retaining existing default audio unit ${CURRENT_DEFAULT_AUDIO}"
         else
-            log_msg SKIP phase3 runtime-audio "no detected audio device to persist"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase3 runtime-audio "no detected audio device to persist"
         endif
     else
-        log_msg SKIP phase3 runtime-audio "default audio selection unchanged"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase3 runtime-audio "default audio selection unchanged"
     endif
 
     set SYSCTL_CONTENT = `mktemp "${STATE_DIR}/sysctl-block.XXXXXX"`
@@ -550,7 +574,7 @@ EOF
     /bin/echo "# managed by ${SCRIPT_NAME} run ${RUN_ID}" >>! "${SYSCTL_CONTENT}"
     foreach SYSCTL_LINE ( ${SYSCTL_LINES} )
         /bin/echo "${SYSCTL_LINE}" >>! "${SYSCTL_CONTENT}"
-        log_msg INFO phase3 persistent-sysctl "planned persistent sysctl ${SYSCTL_LINE}"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase3 persistent-sysctl "planned persistent sysctl ${SYSCTL_LINE}"
     end
     /bin/echo "${MANAGED_END}" >>! "${SYSCTL_CONTENT}"
 
@@ -567,35 +591,35 @@ EOF
     cmp -s /etc/sysctl.conf "${SYSCTL_TMP}"
     if ( $status == 0 ) then
         /bin/rm -f "${SYSCTL_TMP}"
-        log_msg SKIP phase3 persistent-sysctl "/etc/sysctl.conf already converged"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase3 persistent-sysctl "/etc/sysctl.conf already converged"
     else
         set SAFE_PATH = `echo "/etc/sysctl.conf" | sed 's#^/##; s#[/[:space:]]#_#g'`
         set BACKUP_FILE = "${BACKUP_DIR}/${SAFE_PATH}.${RUN_ID}.bak"
         /bin/cp -p /etc/sysctl.conf "${BACKUP_FILE}"
         if ( $status != 0 ) then
             /bin/rm -f "${SYSCTL_TMP}"
-            log_msg ERROR phase3 persistent-sysctl "failed to back up /etc/sysctl.conf"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase3 persistent-sysctl "failed to back up /etc/sysctl.conf"
             set EXIT_CODE = ${EXIT_CODE_CONFIG}
             goto CLEAN_EXIT
         endif
         /bin/echo "/etc/sysctl.conf|${BACKUP_FILE}" >>! "${ROLLBACK_MANIFEST}"
-        log_msg INFO phase3 persistent-sysctl "backup created at ${BACKUP_FILE}"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase3 persistent-sysctl "backup created at ${BACKUP_FILE}"
         /bin/mv -f "${SYSCTL_TMP}" /etc/sysctl.conf
         if ( $status != 0 ) then
             /bin/cp -p "${BACKUP_FILE}" /etc/sysctl.conf >& /dev/null
             set ROLLBACK_OCCURRED = 1
-            log_msg ERROR phase3 persistent-sysctl "atomic replace failed; backup restored"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase3 persistent-sysctl "atomic replace failed; backup restored"
             set EXIT_CODE = ${EXIT_CODE_ROLLBACK}
             goto CLEAN_EXIT
         endif
         /bin/echo "${RUN_ID}|/etc/sysctl.conf|${BACKUP_FILE}" >>! "${CHANGE_MANIFEST}"
-        log_msg OK phase3 persistent-sysctl "/etc/sysctl.conf updated atomically"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase3 persistent-sysctl "/etc/sysctl.conf updated atomically"
     endif
 
     /bin/rm -f "${SYSCTL_CONTENT}" "${AUDIO_PLAN_TMP}"
 
-    mark_checkpoint phase3
-    log_msg OK phase3 end "conservative tuning completed"
+    /bin/csh "${CHECKPOINT_HELPER}" "${CHECKPOINT_FILE}" phase3
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase3 end "conservative tuning completed"
 endif
 
 #
@@ -609,51 +633,51 @@ if ( -e "${CHECKPOINT_FILE}" && ${FORCE} == 0 ) then
 endif
 
 if ( ${SKIP_PHASE} == 1 ) then
-    log_msg SKIP phase4 resume "checkpoint already completed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase4 resume "checkpoint already completed"
 else
-    log_msg INFO phase4 start "ensuring pkg bootstrap and repository readiness"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase4 start "ensuring pkg bootstrap and repository readiness"
 
     "${PKG_BIN}" -N >/dev/null 2>&1
     if ( $status != 0 ) then
         setenv ASSUME_ALWAYS_YES yes
         "${PKG_BIN}" bootstrap -yf >>& "${LOG_FILE}"
         if ( $status != 0 ) then
-            log_msg ERROR phase4 bootstrap "pkg bootstrap failed"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase4 bootstrap "pkg bootstrap failed"
             set EXIT_CODE = ${EXIT_CODE_PACKAGE}
             goto CLEAN_EXIT
         endif
         rehash
         set PKG_BIN = `which pkg 2>/dev/null`
-        log_msg OK phase4 bootstrap "pkg bootstrapped successfully"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase4 bootstrap "pkg bootstrapped successfully"
     else
-        log_msg SKIP phase4 bootstrap "pkg already initialized"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase4 bootstrap "pkg already initialized"
     endif
 
     "${PKG_BIN}" update >>& "${LOG_FILE}"
     if ( $status != 0 ) then
-        log_msg ERROR phase4 update "pkg repository metadata update failed"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase4 update "pkg repository metadata update failed"
         set EXIT_CODE = ${EXIT_CODE_PACKAGE}
         goto CLEAN_EXIT
     endif
-    log_msg OK phase4 update "pkg repository metadata updated"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase4 update "pkg repository metadata updated"
 
     if ( ${SKIP_UPGRADE} == 0 ) then
         "${PKG_BIN}" upgrade -y >>& "${LOG_FILE}"
         if ( $status == 0 ) then
-            log_msg OK phase4 upgrade "pkg upgrade completed"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase4 upgrade "pkg upgrade completed"
         else
-            log_msg WARN phase4 upgrade "pkg upgrade reported non-zero status; continuing"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN phase4 upgrade "pkg upgrade reported non-zero status; continuing"
         endif
     else
-        log_msg SKIP phase4 upgrade "package upgrade skipped by flag"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase4 upgrade "package upgrade skipped by flag"
     endif
 
     set PKG_ABI = `("${PKG_BIN}" -vv 2>/dev/null | awk -F'"' '/ABI/ {print $2; exit}')`
     if ( "${PKG_ABI}" == "" ) set PKG_ABI = "unknown"
-    log_msg INFO phase4 context "repository ABI ${PKG_ABI}"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase4 context "repository ABI ${PKG_ABI}"
 
-    mark_checkpoint phase4
-    log_msg OK phase4 end "package manager readiness completed"
+    /bin/csh "${CHECKPOINT_HELPER}" "${CHECKPOINT_FILE}" phase4
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase4 end "package manager readiness completed"
 endif
 
 #
@@ -667,9 +691,9 @@ if ( -e "${CHECKPOINT_FILE}" && ${FORCE} == 0 ) then
 endif
 
 if ( ${SKIP_PHASE} == 1 ) then
-    log_msg SKIP phase5 resume "checkpoint already completed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase5 resume "checkpoint already completed"
 else
-    log_msg INFO phase5 start "building hardware-aware plan"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase5 start "building hardware-aware plan"
 
     set GPU_PLAN = "unknown-generic"
     if ( egrep -iq '(intel|i915|iris|uhd|hd graphics)' "${HARDWARE_SNAPSHOT}" ) then
@@ -679,7 +703,7 @@ else
     else if ( egrep -iq '(radeon|firepro|tahiti|pitcairn|bonaire|oland|cape verde|caicos|cedar|turks)' "${HARDWARE_SNAPSHOT}" ) then
         set GPU_PLAN = "amd-radeon"
     endif
-    log_msg INFO phase5 gpu-plan "classified GPU plan as ${GPU_PLAN}"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase5 gpu-plan "classified GPU plan as ${GPU_PLAN}"
 
     set AUDIO_PLAN_TMP = `mktemp "${STATE_DIR}/audio-plan.XXXXXX"`
     if ( -r /dev/sndstat ) then
@@ -742,14 +766,14 @@ EOF
     set AUDIO_PLAN_CLASS = `awk -F= '/^CLASS=/{print $2}' "${AUDIO_PLAN_TMP}"`
     set SELECTED_AUDIO_UNIT = `awk -F= '/^SELECTED=/{print $2}' "${AUDIO_PLAN_TMP}"`
     set AUDIO_PLAN_REASON = `awk -F= '/^REASON=/{print $2}' "${AUDIO_PLAN_TMP}"`
-    log_msg INFO phase5 audio-plan "classified audio plan as ${AUDIO_PLAN_CLASS}; selected unit ${SELECTED_AUDIO_UNIT}"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase5 audio-plan "classified audio plan as ${AUDIO_PLAN_CLASS}; selected unit ${SELECTED_AUDIO_UNIT}"
 
     sysctl -n hw.backlight_max >/dev/null 2>&1
     if ( $status == 0 ) then
         sysctl -n hw.backlight_level >/dev/null 2>&1
         if ( $status == 0 ) then
             set BACKLIGHT_MANAGEABLE = 1
-            log_msg INFO phase5 backlight-plan "backlight sysctls detected"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase5 backlight-plan "backlight sysctls detected"
         endif
     endif
     if ( ${BACKLIGHT_MANAGEABLE} == 0 ) log_msg SKIP phase5 backlight-plan "backlight sysctls not present"
@@ -770,9 +794,9 @@ EOF
         if ( $status == 0 ) set KEYBOARD_VALID = 1
     endif
     if ( ${KEYBOARD_VALID} == 1 ) then
-        log_msg OK phase5 keyboard-plan "xkb layout ${KEYBOARD_LAYOUT} validated against installed rules"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase5 keyboard-plan "xkb layout ${KEYBOARD_LAYOUT} validated against installed rules"
     else
-        log_msg WARN phase5 keyboard-plan "authoritative xkb validation deferred until XKB data is available"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN phase5 keyboard-plan "authoritative xkb validation deferred until XKB data is available"
     endif
 
     cat >! "${PLAN_FILE}" <<EOF
@@ -788,8 +812,8 @@ EOF
 
     /bin/rm -f "${AUDIO_PLAN_TMP}"
 
-    mark_checkpoint phase5
-    log_msg OK phase5 end "hardware-aware planning completed"
+    /bin/csh "${CHECKPOINT_HELPER}" "${CHECKPOINT_FILE}" phase5
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase5 end "hardware-aware planning completed"
 endif
 
 #
@@ -803,9 +827,9 @@ if ( -e "${CHECKPOINT_FILE}" && ${FORCE} == 0 ) then
 endif
 
 if ( ${SKIP_PHASE} == 1 ) then
-    log_msg SKIP phase6 resume "checkpoint already completed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase6 resume "checkpoint already completed"
 else
-    log_msg INFO phase6 start "resolving package capabilities"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase6 start "resolving package capabilities"
 
     set SLOT_FILE = `mktemp "${STATE_DIR}/pkg-slots.XXXXXX"`
     cat >! "${SLOT_FILE}" <<EOF
@@ -852,43 +876,43 @@ EOF
         set SLOT_CANDIDATES = `echo "${SLOT_LINE}" | awk -F'|' '{print $3}'`
         set SLOT_RESOLVED = 0
 
-        log_msg INFO phase6 "resolve-${SLOT_NAME}" "resolving ${SLOT_CLASS} package slot ${SLOT_NAME}"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase6 "resolve-${SLOT_NAME}" "resolving ${SLOT_CLASS} package slot ${SLOT_NAME}"
 
         foreach CANDIDATE ( `echo "${SLOT_CANDIDATES}" | tr ',' ' '` )
             "${PKG_BIN}" search -q -e "${CANDIDATE}" >/dev/null 2>&1
             if ( $status != 0 ) then
-                log_msg SKIP phase6 "resolve-${SLOT_NAME}" "candidate ${CANDIDATE} not available"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase6 "resolve-${SLOT_NAME}" "candidate ${CANDIDATE} not available"
                 continue
             endif
 
             "${PKG_BIN}" info -e "${CANDIDATE}" >/dev/null 2>&1
             if ( $status == 0 ) then
                 /bin/echo "${SLOT_NAME}=${CANDIDATE}" >>! "${CHOSEN_PACKAGES_FILE}"
-                log_msg OK phase6 "install-${SLOT_NAME}" "package ${CANDIDATE} already installed"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase6 "install-${SLOT_NAME}" "package ${CANDIDATE} already installed"
                 set SLOT_RESOLVED = 1
                 break
             endif
 
-            log_msg INFO phase6 "install-${SLOT_NAME}" "installing ${CANDIDATE}"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase6 "install-${SLOT_NAME}" "installing ${CANDIDATE}"
             "${PKG_BIN}" install -y "${CANDIDATE}" >>& "${LOG_FILE}"
             if ( $status == 0 ) then
                 /bin/echo "${SLOT_NAME}=${CANDIDATE}" >>! "${CHOSEN_PACKAGES_FILE}"
-                log_msg OK phase6 "install-${SLOT_NAME}" "installed ${CANDIDATE}"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase6 "install-${SLOT_NAME}" "installed ${CANDIDATE}"
                 set SLOT_RESOLVED = 1
                 break
             else
-                log_msg WARN phase6 "install-${SLOT_NAME}" "install failed for ${CANDIDATE}; trying next candidate"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN phase6 "install-${SLOT_NAME}" "install failed for ${CANDIDATE}; trying next candidate"
             endif
         end
 
         if ( ${SLOT_RESOLVED} == 0 ) then
             if ( "${SLOT_CLASS}" == "REQUIRED" ) then
-                log_msg ERROR phase6 "resolve-${SLOT_NAME}" "required slot ${SLOT_NAME} could not be resolved"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase6 "resolve-${SLOT_NAME}" "required slot ${SLOT_NAME} could not be resolved"
                 set EXIT_CODE = ${EXIT_CODE_PACKAGE}
                 /bin/rm -f "${SLOT_FILE}"
                 goto CLEAN_EXIT
             else
-                log_msg WARN phase6 "resolve-${SLOT_NAME}" "optional slot ${SLOT_NAME} unresolved"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN phase6 "resolve-${SLOT_NAME}" "optional slot ${SLOT_NAME} unresolved"
             endif
         endif
 
@@ -904,8 +928,8 @@ EOF
 
     /bin/rm -f "${SLOT_FILE}"
 
-    mark_checkpoint phase6
-    log_msg OK phase6 end "package resolution completed"
+    /bin/csh "${CHECKPOINT_HELPER}" "${CHECKPOINT_FILE}" phase6
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase6 end "package resolution completed"
 endif
 
 #
@@ -919,9 +943,9 @@ if ( -e "${CHECKPOINT_FILE}" && ${FORCE} == 0 ) then
 endif
 
 if ( ${SKIP_PHASE} == 1 ) then
-    log_msg SKIP phase7 resume "checkpoint already completed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase7 resume "checkpoint already completed"
 else
-    log_msg INFO phase7 start "writing rc.conf, loader.conf, sysctl.conf, and /etc/ttys"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase7 start "writing rc.conf, loader.conf, sysctl.conf, and /etc/ttys"
 
     #
     # /etc/rc.conf
@@ -945,29 +969,29 @@ else
     cmp -s /etc/rc.conf "${RC_TMP}"
     if ( $status == 0 ) then
         /bin/rm -f "${RC_TMP}"
-        log_msg SKIP phase7 rc-conf "/etc/rc.conf already converged"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase7 rc-conf "/etc/rc.conf already converged"
     else
         set SAFE_PATH = `echo "/etc/rc.conf" | sed 's#^/##; s#[/[:space:]]#_#g'`
         set BACKUP_FILE = "${BACKUP_DIR}/${SAFE_PATH}.${RUN_ID}.bak"
         /bin/cp -p /etc/rc.conf "${BACKUP_FILE}"
         if ( $status != 0 ) then
             /bin/rm -f "${RC_TMP}"
-            log_msg ERROR phase7 rc-conf "failed to back up /etc/rc.conf"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase7 rc-conf "failed to back up /etc/rc.conf"
             set EXIT_CODE = ${EXIT_CODE_CONFIG}
             goto CLEAN_EXIT
         endif
         /bin/echo "/etc/rc.conf|${BACKUP_FILE}" >>! "${ROLLBACK_MANIFEST}"
-        log_msg INFO phase7 rc-conf "backup created at ${BACKUP_FILE}"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase7 rc-conf "backup created at ${BACKUP_FILE}"
         /bin/mv -f "${RC_TMP}" /etc/rc.conf
         if ( $status != 0 ) then
             /bin/cp -p "${BACKUP_FILE}" /etc/rc.conf >& /dev/null
             set ROLLBACK_OCCURRED = 1
-            log_msg ERROR phase7 rc-conf "atomic replace failed; backup restored"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase7 rc-conf "atomic replace failed; backup restored"
             set EXIT_CODE = ${EXIT_CODE_ROLLBACK}
             goto CLEAN_EXIT
         endif
         /bin/echo "${RUN_ID}|/etc/rc.conf|${BACKUP_FILE}" >>! "${CHANGE_MANIFEST}"
-        log_msg OK phase7 rc-conf "/etc/rc.conf updated atomically"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase7 rc-conf "/etc/rc.conf updated atomically"
     endif
     /bin/rm -f "${RC_CONTENT}"
 
@@ -993,29 +1017,29 @@ else
     cmp -s /boot/loader.conf "${LOADER_TMP}"
     if ( $status == 0 ) then
         /bin/rm -f "${LOADER_TMP}"
-        log_msg SKIP phase7 loader-conf "/boot/loader.conf already converged"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase7 loader-conf "/boot/loader.conf already converged"
     else
         set SAFE_PATH = `echo "/boot/loader.conf" | sed 's#^/##; s#[/[:space:]]#_#g'`
         set BACKUP_FILE = "${BACKUP_DIR}/${SAFE_PATH}.${RUN_ID}.bak"
         /bin/cp -p /boot/loader.conf "${BACKUP_FILE}"
         if ( $status != 0 ) then
             /bin/rm -f "${LOADER_TMP}"
-            log_msg ERROR phase7 loader-conf "failed to back up /boot/loader.conf"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase7 loader-conf "failed to back up /boot/loader.conf"
             set EXIT_CODE = ${EXIT_CODE_CONFIG}
             goto CLEAN_EXIT
         endif
         /bin/echo "/boot/loader.conf|${BACKUP_FILE}" >>! "${ROLLBACK_MANIFEST}"
-        log_msg INFO phase7 loader-conf "backup created at ${BACKUP_FILE}"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase7 loader-conf "backup created at ${BACKUP_FILE}"
         /bin/mv -f "${LOADER_TMP}" /boot/loader.conf
         if ( $status != 0 ) then
             /bin/cp -p "${BACKUP_FILE}" /boot/loader.conf >& /dev/null
             set ROLLBACK_OCCURRED = 1
-            log_msg ERROR phase7 loader-conf "atomic replace failed; backup restored"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase7 loader-conf "atomic replace failed; backup restored"
             set EXIT_CODE = ${EXIT_CODE_ROLLBACK}
             goto CLEAN_EXIT
         endif
         /bin/echo "${RUN_ID}|/boot/loader.conf|${BACKUP_FILE}" >>! "${CHANGE_MANIFEST}"
-        log_msg OK phase7 loader-conf "/boot/loader.conf updated atomically"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase7 loader-conf "/boot/loader.conf updated atomically"
     endif
     /bin/rm -f "${LOADER_CONTENT}"
 
@@ -1048,29 +1072,29 @@ else
     cmp -s /etc/sysctl.conf "${SYSCTL_TMP}"
     if ( $status == 0 ) then
         /bin/rm -f "${SYSCTL_TMP}"
-        log_msg SKIP phase7 sysctl-conf "/etc/sysctl.conf already converged"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase7 sysctl-conf "/etc/sysctl.conf already converged"
     else
         set SAFE_PATH = `echo "/etc/sysctl.conf" | sed 's#^/##; s#[/[:space:]]#_#g'`
         set BACKUP_FILE = "${BACKUP_DIR}/${SAFE_PATH}.${RUN_ID}.bak"
         /bin/cp -p /etc/sysctl.conf "${BACKUP_FILE}"
         if ( $status != 0 ) then
             /bin/rm -f "${SYSCTL_TMP}"
-            log_msg ERROR phase7 sysctl-conf "failed to back up /etc/sysctl.conf"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase7 sysctl-conf "failed to back up /etc/sysctl.conf"
             set EXIT_CODE = ${EXIT_CODE_CONFIG}
             goto CLEAN_EXIT
         endif
         /bin/echo "/etc/sysctl.conf|${BACKUP_FILE}" >>! "${ROLLBACK_MANIFEST}"
-        log_msg INFO phase7 sysctl-conf "backup created at ${BACKUP_FILE}"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase7 sysctl-conf "backup created at ${BACKUP_FILE}"
         /bin/mv -f "${SYSCTL_TMP}" /etc/sysctl.conf
         if ( $status != 0 ) then
             /bin/cp -p "${BACKUP_FILE}" /etc/sysctl.conf >& /dev/null
             set ROLLBACK_OCCURRED = 1
-            log_msg ERROR phase7 sysctl-conf "atomic replace failed; backup restored"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase7 sysctl-conf "atomic replace failed; backup restored"
             set EXIT_CODE = ${EXIT_CODE_ROLLBACK}
             goto CLEAN_EXIT
         endif
         /bin/echo "${RUN_ID}|/etc/sysctl.conf|${BACKUP_FILE}" >>! "${CHANGE_MANIFEST}"
-        log_msg OK phase7 sysctl-conf "/etc/sysctl.conf updated atomically"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase7 sysctl-conf "/etc/sysctl.conf updated atomically"
     endif
     /bin/rm -f "${SYSCTL_CONTENT}"
 
@@ -1078,7 +1102,7 @@ else
     # /etc/ttys
     #
     if ( ! -e /etc/ttys ) then
-        log_msg ERROR phase7 ttys "/etc/ttys not found"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase7 ttys "/etc/ttys not found"
         set EXIT_CODE = ${EXIT_CODE_CONFIG}
         goto CLEAN_EXIT
     endif
@@ -1118,7 +1142,7 @@ else
     grep -Eq '^[[:space:]]*ttyv8[[:space:]]+' "${TTYS_TMP}" >/dev/null 2>&1
     if ( $status != 0 ) then
         /bin/rm -f "${TTYS_TMP}"
-        log_msg ERROR phase7 ttys "generated /etc/ttys does not contain ttyv8 entry"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase7 ttys "generated /etc/ttys does not contain ttyv8 entry"
         set EXIT_CODE = ${EXIT_CODE_CONFIG}
         goto CLEAN_EXIT
     endif
@@ -1126,35 +1150,35 @@ else
     cmp -s /etc/ttys "${TTYS_TMP}"
     if ( $status == 0 ) then
         /bin/rm -f "${TTYS_TMP}"
-        log_msg SKIP phase7 ttys "/etc/ttys already converged for ttyv8 xdm enablement"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase7 ttys "/etc/ttys already converged for ttyv8 xdm enablement"
     else
         set SAFE_PATH = `echo "/etc/ttys" | sed 's#^/##; s#[/[:space:]]#_#g'`
         set BACKUP_FILE = "${BACKUP_DIR}/${SAFE_PATH}.${RUN_ID}.bak"
         /bin/cp -p /etc/ttys "${BACKUP_FILE}"
         if ( $status != 0 ) then
             /bin/rm -f "${TTYS_TMP}"
-            log_msg ERROR phase7 ttys "failed to back up /etc/ttys"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase7 ttys "failed to back up /etc/ttys"
             set EXIT_CODE = ${EXIT_CODE_CONFIG}
             goto CLEAN_EXIT
         endif
         /bin/echo "/etc/ttys|${BACKUP_FILE}" >>! "${ROLLBACK_MANIFEST}"
-        log_msg INFO phase7 ttys "backup created at ${BACKUP_FILE}"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase7 ttys "backup created at ${BACKUP_FILE}"
         /bin/mv -f "${TTYS_TMP}" /etc/ttys
         if ( $status != 0 ) then
             /bin/cp -p "${BACKUP_FILE}" /etc/ttys >& /dev/null
             set ROLLBACK_OCCURRED = 1
-            log_msg ERROR phase7 ttys "atomic replace failed; backup restored"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase7 ttys "atomic replace failed; backup restored"
             set EXIT_CODE = ${EXIT_CODE_ROLLBACK}
             goto CLEAN_EXIT
         endif
         set TTYS_CHANGED = 1
         NEED_REBOOT = 1
         /bin/echo "${RUN_ID}|/etc/ttys|${BACKUP_FILE}" >>! "${CHANGE_MANIFEST}"
-        log_msg OK phase7 ttys "/etc/ttys updated atomically"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase7 ttys "/etc/ttys updated atomically"
     endif
 
-    mark_checkpoint phase7
-    log_msg OK phase7 end "system configuration completed"
+    /bin/csh "${CHECKPOINT_HELPER}" "${CHECKPOINT_FILE}" phase7
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase7 end "system configuration completed"
 endif
 
 #
@@ -1168,13 +1192,13 @@ if ( -e "${CHECKPOINT_FILE}" && ${FORCE} == 0 ) then
 endif
 
 if ( ${SKIP_PHASE} == 1 ) then
-    log_msg SKIP phase8 resume "checkpoint already completed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase8 resume "checkpoint already completed"
 else
-    log_msg INFO phase8 start "generating minimal X11 configuration"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase8 start "generating minimal X11 configuration"
 
     /bin/mkdir -p /etc/X11/xorg.conf.d
     if ( $status != 0 ) then
-        log_msg ERROR phase8 xorg-dir "failed to create /etc/X11/xorg.conf.d"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase8 xorg-dir "failed to create /etc/X11/xorg.conf.d"
         set EXIT_CODE = ${EXIT_CODE_CONFIG}
         goto CLEAN_EXIT
     endif
@@ -1184,7 +1208,7 @@ else
         if ( -r "${RULEFILE}" ) set XKB_RULES_FILE = "${RULEFILE}"
     end
     if ( "${XKB_RULES_FILE}" == "" ) then
-        log_msg ERROR phase8 validate-keyboard "XKB rules file not found after package installation"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase8 validate-keyboard "XKB rules file not found after package installation"
         set EXIT_CODE = ${EXIT_CODE_VALIDATE}
         goto CLEAN_EXIT
     endif
@@ -1197,11 +1221,11 @@ else
         END { exit(ok ? 0 : 1) }
     ' "${XKB_RULES_FILE}" >/dev/null 2>&1
     if ( $status != 0 ) then
-        log_msg ERROR phase8 validate-keyboard "keyboard layout ${KEYBOARD_LAYOUT} not found in installed XKB data"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase8 validate-keyboard "keyboard layout ${KEYBOARD_LAYOUT} not found in installed XKB data"
         set EXIT_CODE = ${EXIT_CODE_VALIDATE}
         goto CLEAN_EXIT
     endif
-    log_msg OK phase8 validate-keyboard "authoritative XKB validation passed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase8 validate-keyboard "authoritative XKB validation passed"
 
     set KB_FILE = "/etc/X11/xorg.conf.d/00-keyboard.conf"
     set KB_TMP = `mktemp "${KB_FILE}.XXXXXX"`
@@ -1223,7 +1247,7 @@ EOF
     endif
     if ( $status == 0 ) then
         /bin/rm -f "${KB_TMP}"
-        log_msg SKIP phase8 keyboard-file "${KB_FILE} already converged"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase8 keyboard-file "${KB_FILE} already converged"
     else
         if ( -e "${KB_FILE}" ) then
             set SAFE_PATH = `echo "${KB_FILE}" | sed 's#^/##; s#[/[:space:]]#_#g'`
@@ -1231,23 +1255,23 @@ EOF
             /bin/cp -p "${KB_FILE}" "${BACKUP_FILE}"
             if ( $status != 0 ) then
                 /bin/rm -f "${KB_TMP}"
-                log_msg ERROR phase8 keyboard-file "failed to back up ${KB_FILE}"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase8 keyboard-file "failed to back up ${KB_FILE}"
                 set EXIT_CODE = ${EXIT_CODE_CONFIG}
                 goto CLEAN_EXIT
             endif
             /bin/echo "${KB_FILE}|${BACKUP_FILE}" >>! "${ROLLBACK_MANIFEST}"
-            log_msg INFO phase8 keyboard-file "backup created at ${BACKUP_FILE}"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase8 keyboard-file "backup created at ${BACKUP_FILE}"
         endif
         /bin/mv -f "${KB_TMP}" "${KB_FILE}"
         if ( $status != 0 ) then
             if ( $?BACKUP_FILE ) /bin/cp -p "${BACKUP_FILE}" "${KB_FILE}" >& /dev/null
             set ROLLBACK_OCCURRED = 1
-            log_msg ERROR phase8 keyboard-file "atomic replace failed for ${KB_FILE}"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase8 keyboard-file "atomic replace failed for ${KB_FILE}"
             set EXIT_CODE = ${EXIT_CODE_ROLLBACK}
             goto CLEAN_EXIT
         endif
         /bin/echo "${RUN_ID}|${KB_FILE}|${BACKUP_FILE}" >>! "${CHANGE_MANIFEST}"
-        log_msg OK phase8 keyboard-file "${KB_FILE} written"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase8 keyboard-file "${KB_FILE} written"
     endif
 
     set NEED_LIBINPUT = 1
@@ -1281,7 +1305,7 @@ EOF
         endif
         if ( $status == 0 ) then
             /bin/rm -f "${LI_TMP}"
-            log_msg SKIP phase8 libinput-file "${LI_FILE} already converged"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase8 libinput-file "${LI_FILE} already converged"
         else
             if ( -e "${LI_FILE}" ) then
                 set SAFE_PATH = `echo "${LI_FILE}" | sed 's#^/##; s#[/[:space:]]#_#g'`
@@ -1289,32 +1313,32 @@ EOF
                 /bin/cp -p "${LI_FILE}" "${BACKUP_FILE}"
                 if ( $status != 0 ) then
                     /bin/rm -f "${LI_TMP}"
-                    log_msg ERROR phase8 libinput-file "failed to back up ${LI_FILE}"
+                    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase8 libinput-file "failed to back up ${LI_FILE}"
                     set EXIT_CODE = ${EXIT_CODE_CONFIG}
                     goto CLEAN_EXIT
                 endif
                 /bin/echo "${LI_FILE}|${BACKUP_FILE}" >>! "${ROLLBACK_MANIFEST}"
-                log_msg INFO phase8 libinput-file "backup created at ${BACKUP_FILE}"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase8 libinput-file "backup created at ${BACKUP_FILE}"
             endif
             /bin/mv -f "${LI_TMP}" "${LI_FILE}"
             if ( $status != 0 ) then
                 if ( $?BACKUP_FILE ) /bin/cp -p "${BACKUP_FILE}" "${LI_FILE}" >& /dev/null
                 set ROLLBACK_OCCURRED = 1
-                log_msg ERROR phase8 libinput-file "atomic replace failed for ${LI_FILE}"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase8 libinput-file "atomic replace failed for ${LI_FILE}"
                 set EXIT_CODE = ${EXIT_CODE_ROLLBACK}
                 goto CLEAN_EXIT
             endif
             /bin/echo "${RUN_ID}|${LI_FILE}|${BACKUP_FILE}" >>! "${CHANGE_MANIFEST}"
-            log_msg OK phase8 libinput-file "${LI_FILE} written"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase8 libinput-file "${LI_FILE} written"
         endif
     else
-        log_msg SKIP phase8 libinput-file "existing libinput configuration already present"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase8 libinput-file "existing libinput configuration already present"
     endif
 
-    log_msg SKIP phase8 video-permissions "explicit DRI stanza not required; relying on autodetection and video group"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase8 video-permissions "explicit DRI stanza not required; relying on autodetection and video group"
 
-    mark_checkpoint phase8
-    log_msg OK phase8 end "X11 configuration completed"
+    /bin/csh "${CHECKPOINT_HELPER}" "${CHECKPOINT_FILE}" phase8
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase8 end "X11 configuration completed"
 endif
 
 #
@@ -1328,38 +1352,38 @@ if ( -e "${CHECKPOINT_FILE}" && ${FORCE} == 0 ) then
 endif
 
 if ( ${SKIP_PHASE} == 1 ) then
-    log_msg SKIP phase9 resume "checkpoint already completed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase9 resume "checkpoint already completed"
 else
-    log_msg INFO phase9 start "provisioning user session files and group membership"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase9 start "provisioning user session files and group membership"
 
     pw groupshow video >/dev/null 2>&1
     if ( $status != 0 ) then
         pw groupadd video >/dev/null 2>&1
         if ( $status != 0 ) then
-            log_msg ERROR phase9 video-group "failed to create video group"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase9 video-group "failed to create video group"
             set EXIT_CODE = ${EXIT_CODE_CONFIG}
             goto CLEAN_EXIT
         endif
-        log_msg OK phase9 video-group "created missing video group"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase9 video-group "created missing video group"
     endif
 
     id -Gn "${TARGET_USER}" | tr ' ' '\n' | grep -qx "video" >/dev/null 2>&1
     if ( $status != 0 ) then
         pw groupmod video -m "${TARGET_USER}" >/dev/null 2>&1
         if ( $status != 0 ) then
-            log_msg ERROR phase9 video-group "failed to add ${TARGET_USER} to video group"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase9 video-group "failed to add ${TARGET_USER} to video group"
             set EXIT_CODE = ${EXIT_CODE_CONFIG}
             goto CLEAN_EXIT
         endif
         NEED_RELOGIN = 1
-        log_msg OK phase9 video-group "added ${TARGET_USER} to video group"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase9 video-group "added ${TARGET_USER} to video group"
     else
-        log_msg SKIP phase9 video-group "${TARGET_USER} already in video group"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase9 video-group "${TARGET_USER} already in video group"
     endif
 
     /bin/mkdir -p "${TARGET_HOME}/.config/turkishvan-bsd"
     if ( $status != 0 ) then
-        log_msg ERROR phase9 user-dir "failed to create ${TARGET_HOME}/.config/turkishvan-bsd"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase9 user-dir "failed to create ${TARGET_HOME}/.config/turkishvan-bsd"
         set EXIT_CODE = ${EXIT_CODE_CONFIG}
         goto CLEAN_EXIT
     endif
@@ -1376,11 +1400,11 @@ else
         set GNUSTEP_ENV = `("${PKG_BIN}" info -l gnustep 2>/dev/null; "${PKG_BIN}" info -l gnustep-back 2>/dev/null; "${PKG_BIN}" info -l gnustep-make 2>/dev/null) | awk '$1 ~ /^\/.*\.csh$/ && tolower($1) ~ /gnustep/ {print $1; exit}'`
     endif
     if ( "${GNUSTEP_ENV}" == "" || ! -r "${GNUSTEP_ENV}" ) then
-        log_msg ERROR phase9 gnustep-env "GNUstep appears installed but no readable csh-compatible environment script was found"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase9 gnustep-env "GNUstep appears installed but no readable csh-compatible environment script was found"
         set EXIT_CODE = ${EXIT_CODE_VALIDATE}
         goto CLEAN_EXIT
     endif
-    log_msg OK phase9 gnustep-env "using GNUstep environment script ${GNUSTEP_ENV}"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase9 gnustep-env "using GNUstep environment script ${GNUSTEP_ENV}"
 
     set XSESSION_FILE = "${TARGET_HOME}/.xsession"
     set XSESSION_TMP = `mktemp "${STATE_DIR}/xsession.XXXXXX"`
@@ -1425,7 +1449,7 @@ EOF
     endif
     if ( $status == 0 ) then
         /bin/rm -f "${XSESSION_TMP}"
-        log_msg SKIP phase9 xsession "${XSESSION_FILE} already converged"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase9 xsession "${XSESSION_FILE} already converged"
     else
         if ( -e "${XSESSION_FILE}" ) then
             set SAFE_PATH = `echo "${XSESSION_FILE}" | sed 's#^/##; s#[/[:space:]]#_#g'`
@@ -1433,25 +1457,25 @@ EOF
             /bin/cp -p "${XSESSION_FILE}" "${BACKUP_FILE}"
             if ( $status != 0 ) then
                 /bin/rm -f "${XSESSION_TMP}"
-                log_msg ERROR phase9 xsession "failed to back up ${XSESSION_FILE}"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase9 xsession "failed to back up ${XSESSION_FILE}"
                 set EXIT_CODE = ${EXIT_CODE_CONFIG}
                 goto CLEAN_EXIT
             endif
             /bin/echo "${XSESSION_FILE}|${BACKUP_FILE}" >>! "${ROLLBACK_MANIFEST}"
-            log_msg WARN phase9 xsession "replacing existing user file after backup ${BACKUP_FILE}"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN phase9 xsession "replacing existing user file after backup ${BACKUP_FILE}"
         endif
         /bin/mv -f "${XSESSION_TMP}" "${XSESSION_FILE}"
         if ( $status != 0 ) then
             if ( $?BACKUP_FILE ) /bin/cp -p "${BACKUP_FILE}" "${XSESSION_FILE}" >& /dev/null
             set ROLLBACK_OCCURRED = 1
-            log_msg ERROR phase9 xsession "atomic replace failed for ${XSESSION_FILE}"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase9 xsession "atomic replace failed for ${XSESSION_FILE}"
             set EXIT_CODE = ${EXIT_CODE_ROLLBACK}
             goto CLEAN_EXIT
         endif
         chown "${TARGET_USER}:${TARGET_GROUP}" "${XSESSION_FILE}"
         chmod 0755 "${XSESSION_FILE}"
         /bin/echo "${RUN_ID}|${XSESSION_FILE}|${BACKUP_FILE}" >>! "${CHANGE_MANIFEST}"
-        log_msg OK phase9 xsession "${XSESSION_FILE} written"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase9 xsession "${XSESSION_FILE} written"
     endif
 
     set XINITRC_FILE = "${TARGET_HOME}/.xinitrc"
@@ -1475,7 +1499,7 @@ EOF
     endif
     if ( $status == 0 ) then
         /bin/rm -f "${XINITRC_TMP}"
-        log_msg SKIP phase9 xinitrc "${XINITRC_FILE} already converged"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase9 xinitrc "${XINITRC_FILE} already converged"
     else
         if ( -e "${XINITRC_FILE}" ) then
             set SAFE_PATH = `echo "${XINITRC_FILE}" | sed 's#^/##; s#[/[:space:]]#_#g'`
@@ -1483,25 +1507,25 @@ EOF
             /bin/cp -p "${XINITRC_FILE}" "${BACKUP_FILE}"
             if ( $status != 0 ) then
                 /bin/rm -f "${XINITRC_TMP}"
-                log_msg ERROR phase9 xinitrc "failed to back up ${XINITRC_FILE}"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase9 xinitrc "failed to back up ${XINITRC_FILE}"
                 set EXIT_CODE = ${EXIT_CODE_CONFIG}
                 goto CLEAN_EXIT
             endif
             /bin/echo "${XINITRC_FILE}|${BACKUP_FILE}" >>! "${ROLLBACK_MANIFEST}"
-            log_msg WARN phase9 xinitrc "replacing existing user file after backup ${BACKUP_FILE}"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN phase9 xinitrc "replacing existing user file after backup ${BACKUP_FILE}"
         endif
         /bin/mv -f "${XINITRC_TMP}" "${XINITRC_FILE}"
         if ( $status != 0 ) then
             if ( $?BACKUP_FILE ) /bin/cp -p "${BACKUP_FILE}" "${XINITRC_FILE}" >& /dev/null
             set ROLLBACK_OCCURRED = 1
-            log_msg ERROR phase9 xinitrc "atomic replace failed for ${XINITRC_FILE}"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase9 xinitrc "atomic replace failed for ${XINITRC_FILE}"
             set EXIT_CODE = ${EXIT_CODE_ROLLBACK}
             goto CLEAN_EXIT
         endif
         chown "${TARGET_USER}:${TARGET_GROUP}" "${XINITRC_FILE}"
         chmod 0755 "${XINITRC_FILE}"
         /bin/echo "${RUN_ID}|${XINITRC_FILE}|${BACKUP_FILE}" >>! "${CHANGE_MANIFEST}"
-        log_msg OK phase9 xinitrc "${XINITRC_FILE} written"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase9 xinitrc "${XINITRC_FILE} written"
     endif
 
     if ( ${BACKLIGHT_MANAGEABLE} == 1 ) then
@@ -1560,25 +1584,25 @@ EOF
         endif
         if ( $status == 0 ) then
             /bin/rm -f "${BRIGHTNESS_TMP}"
-            log_msg SKIP phase9 brightness-helper "${BRIGHTNESS_HELPER} already converged"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase9 brightness-helper "${BRIGHTNESS_HELPER} already converged"
         else
             /bin/mv -f "${BRIGHTNESS_TMP}" "${BRIGHTNESS_HELPER}"
             if ( $status != 0 ) then
                 set ROLLBACK_OCCURRED = 1
-                log_msg ERROR phase9 brightness-helper "failed to write ${BRIGHTNESS_HELPER}"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase9 brightness-helper "failed to write ${BRIGHTNESS_HELPER}"
                 set EXIT_CODE = ${EXIT_CODE_ROLLBACK}
                 goto CLEAN_EXIT
             endif
             chown "${TARGET_USER}:${TARGET_GROUP}" "${BRIGHTNESS_HELPER}"
             chmod 0755 "${BRIGHTNESS_HELPER}"
-            log_msg OK phase9 brightness-helper "generated ${BRIGHTNESS_HELPER}"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase9 brightness-helper "generated ${BRIGHTNESS_HELPER}"
         endif
     else
-        log_msg SKIP phase9 brightness-helper "backlight helper not required on this hardware"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase9 brightness-helper "backlight helper not required on this hardware"
     endif
 
-    mark_checkpoint phase9
-    log_msg OK phase9 end "user provisioning completed"
+    /bin/csh "${CHECKPOINT_HELPER}" "${CHECKPOINT_FILE}" phase9
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase9 end "user provisioning completed"
 endif
 
 #
@@ -1592,42 +1616,42 @@ if ( -e "${CHECKPOINT_FILE}" && ${FORCE} == 0 ) then
 endif
 
 if ( ${SKIP_PHASE} == 1 ) then
-    log_msg SKIP phase10 resume "checkpoint already completed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase10 resume "checkpoint already completed"
 else
-    log_msg INFO phase10 start "converging audio defaults and validation"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase10 start "converging audio defaults and validation"
 
     if ( -r /dev/sndstat ) then
         if ( ${AUDIO_COUNT} > 0 ) then
             if ( "${SELECTED_AUDIO_UNIT}" != "" ) then
                 sysctl hw.snd.default_unit="${SELECTED_AUDIO_UNIT}" >/dev/null 2>&1
                 if ( $status == 0 ) then
-                    log_msg OK phase10 select-default "runtime default audio set to unit ${SELECTED_AUDIO_UNIT}"
+                    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase10 select-default "runtime default audio set to unit ${SELECTED_AUDIO_UNIT}"
                 else
-                    log_msg WARN phase10 select-default "runtime default audio set failed for unit ${SELECTED_AUDIO_UNIT}"
+                    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN phase10 select-default "runtime default audio set failed for unit ${SELECTED_AUDIO_UNIT}"
                 endif
             endif
 
             grep -Eq "^pcm${SELECTED_AUDIO_UNIT}:" /dev/sndstat >/dev/null 2>&1
             if ( "${SELECTED_AUDIO_UNIT}" != "" && $status == 0 ) then
-                log_msg OK phase10 validate-device "selected default device pcm${SELECTED_AUDIO_UNIT} exists"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase10 validate-device "selected default device pcm${SELECTED_AUDIO_UNIT} exists"
             else if ( "${SELECTED_AUDIO_UNIT}" == "" ) then
-                log_msg WARN phase10 validate-device "no selected audio unit despite detected devices"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN phase10 validate-device "no selected audio unit despite detected devices"
             else
-                log_msg ERROR phase10 validate-device "selected audio device pcm${SELECTED_AUDIO_UNIT} is not present"
+                /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase10 validate-device "selected audio device pcm${SELECTED_AUDIO_UNIT} is not present"
                 set EXIT_CODE = ${EXIT_CODE_VALIDATE}
                 goto CLEAN_EXIT
             endif
         else
-            log_msg WARN phase10 detect-audio "no PCM devices detected"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN phase10 detect-audio "no PCM devices detected"
         endif
     else
-        log_msg WARN phase10 detect-audio "/dev/sndstat is not available"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN phase10 detect-audio "/dev/sndstat is not available"
     endif
 
-    log_msg INFO phase10 rationale "audio plan ${AUDIO_PLAN_CLASS}; rationale ${AUDIO_PLAN_REASON}"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase10 rationale "audio plan ${AUDIO_PLAN_CLASS}; rationale ${AUDIO_PLAN_REASON}"
 
-    mark_checkpoint phase10
-    log_msg OK phase10 end "audio configuration completed"
+    /bin/csh "${CHECKPOINT_HELPER}" "${CHECKPOINT_FILE}" phase10
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase10 end "audio configuration completed"
 endif
 
 #
@@ -1641,47 +1665,47 @@ if ( -e "${CHECKPOINT_FILE}" && ${FORCE} == 0 ) then
 endif
 
 if ( ${SKIP_PHASE} == 1 ) then
-    log_msg SKIP phase11 resume "checkpoint already completed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase11 resume "checkpoint already completed"
 else
-    log_msg INFO phase11 start "validating DRM/Xorg display path"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase11 start "validating DRM/Xorg display path"
 
     if ( "${XORG_BIN}" == "" ) set XORG_BIN = `which Xorg 2>/dev/null`
     if ( "${XORG_BIN}" == "" && -x /usr/local/bin/Xorg ) set XORG_BIN = "/usr/local/bin/Xorg"
     if ( "${XORG_BIN}" == "" ) then
-        log_msg ERROR phase11 validate-xorg "Xorg binary not found"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase11 validate-xorg "Xorg binary not found"
         set EXIT_CODE = ${EXIT_CODE_VALIDATE}
         goto CLEAN_EXIT
     endif
-    log_msg OK phase11 validate-xorg "Xorg binary found at ${XORG_BIN}"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase11 validate-xorg "Xorg binary found at ${XORG_BIN}"
 
     if ( "${XDM_BIN}" == "" ) set XDM_BIN = `which xdm 2>/dev/null`
     if ( "${XDM_BIN}" == "" && -x /usr/local/bin/xdm ) set XDM_BIN = "/usr/local/bin/xdm"
     if ( "${XDM_BIN}" == "" ) then
-        log_msg ERROR phase11 validate-xdm "xdm binary not found"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase11 validate-xdm "xdm binary not found"
         set EXIT_CODE = ${EXIT_CODE_VALIDATE}
         goto CLEAN_EXIT
     endif
-    log_msg OK phase11 validate-xdm "xdm binary found at ${XDM_BIN}"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase11 validate-xdm "xdm binary found at ${XDM_BIN}"
 
     if ( ! -f /etc/X11/xorg.conf.d/00-keyboard.conf ) then
-        log_msg ERROR phase11 validate-keyboard "/etc/X11/xorg.conf.d/00-keyboard.conf is missing"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase11 validate-keyboard "/etc/X11/xorg.conf.d/00-keyboard.conf is missing"
         set EXIT_CODE = ${EXIT_CODE_VALIDATE}
         goto CLEAN_EXIT
     endif
-    log_msg OK phase11 validate-keyboard "keyboard drop-in present"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase11 validate-keyboard "keyboard drop-in present"
 
     id -Gn "${TARGET_USER}" | tr ' ' '\n' | grep -qx "video" >/dev/null 2>&1
     if ( $status != 0 ) then
-        log_msg ERROR phase11 validate-video-group "${TARGET_USER} is not in video group"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR phase11 validate-video-group "${TARGET_USER} is not in video group"
         set EXIT_CODE = ${EXIT_CODE_VALIDATE}
         goto CLEAN_EXIT
     endif
-    log_msg OK phase11 validate-video-group "${TARGET_USER} has video group membership"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase11 validate-video-group "${TARGET_USER} has video group membership"
 
-    log_msg INFO phase11 gpu-plan "using conservative DRM/Xorg plan ${GPU_PLAN} with Xorg autodetection"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase11 gpu-plan "using conservative DRM/Xorg plan ${GPU_PLAN} with Xorg autodetection"
 
-    mark_checkpoint phase11
-    log_msg OK phase11 end "video and display validation completed"
+    /bin/csh "${CHECKPOINT_HELPER}" "${CHECKPOINT_FILE}" phase11
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase11 end "video and display validation completed"
 endif
 
 #
@@ -1695,118 +1719,118 @@ if ( -e "${CHECKPOINT_FILE}" && ${FORCE} == 0 ) then
 endif
 
 if ( ${SKIP_PHASE} == 1 ) then
-    log_msg SKIP phase12 resume "checkpoint already completed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" SKIP phase12 resume "checkpoint already completed"
 else
-    log_msg INFO phase12 start "handling XDM activation mode"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO phase12 start "handling XDM activation mode"
 
     if ( ${ACTIVATE_NOW} == 1 ) then
         kill -HUP 1 >& /dev/null
         if ( $status == 0 ) then
             set XDM_ACTIVATION_MODE = "SUCCESS_ACTIVE"
-            log_msg OK phase12 activate-now "init reload requested; XDM activation attempted"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase12 activate-now "init reload requested; XDM activation attempted"
             set NEED_REBOOT = 0
         else
             set XDM_ACTIVATION_MODE = "SUCCESS_PENDING_REBOOT"
             set NEED_REBOOT = 1
-            log_msg WARN phase12 activate-now "init reload failed; reboot or manual init reload required"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN phase12 activate-now "init reload failed; reboot or manual init reload required"
         endif
     else
         pgrep -f xdm >/dev/null 2>&1
         if ( $status == 0 ) then
             set XDM_ACTIVATION_MODE = "SUCCESS_ACTIVE"
-            log_msg OK phase12 activate "xdm process already active"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase12 activate "xdm process already active"
         else
             set XDM_ACTIVATION_MODE = "SUCCESS_PENDING_REBOOT"
             set NEED_REBOOT = 1
-            log_msg WARN phase12 activate "xdm configured but left pending reboot or init reload by conservative policy"
+            /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN phase12 activate "xdm configured but left pending reboot or init reload by conservative policy"
         endif
     endif
 
-    mark_checkpoint phase12
-    log_msg OK phase12 end "XDM enablement handling completed"
+    /bin/csh "${CHECKPOINT_HELPER}" "${CHECKPOINT_FILE}" phase12
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK phase12 end "XDM enablement handling completed"
 endif
 
 #
 # final validation checklist
 #
 
-log_msg INFO final start "running final validation checklist"
+/bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO final start "running final validation checklist"
 
 id "${TARGET_USER}" >/dev/null 2>&1
 if ( $status != 0 || ! -d "${TARGET_HOME}" ) then
-    log_msg ERROR final validate-user "target user or home directory validation failed"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR final validate-user "target user or home directory validation failed"
     set EXIT_CODE = ${EXIT_CODE_VALIDATE}
     goto CLEAN_EXIT
 endif
-log_msg OK final validate-user "target user and home directory verified"
+/bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK final validate-user "target user and home directory verified"
 
 id -Gn "${TARGET_USER}" | tr ' ' '\n' | grep -qx "video" >/dev/null 2>&1
 if ( $status != 0 ) then
-    log_msg ERROR final validate-video "target user is not in video group"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR final validate-video "target user is not in video group"
     set EXIT_CODE = ${EXIT_CODE_VALIDATE}
     goto CLEAN_EXIT
 endif
-log_msg OK final validate-video "target user is in video group"
+/bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK final validate-video "target user is in video group"
 
 foreach REQUIRED_PKG ( xorg xdm gnustep gnustep-back windowmaker )
     "${PKG_BIN}" info -e "${REQUIRED_PKG}" >/dev/null 2>&1
     if ( $status != 0 ) then
-        log_msg ERROR final validate-pkg "required package ${REQUIRED_PKG} is not installed"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR final validate-pkg "required package ${REQUIRED_PKG} is not installed"
         set EXIT_CODE = ${EXIT_CODE_VALIDATE}
         goto CLEAN_EXIT
     endif
 end
-log_msg OK final validate-pkg "required core package set installed"
+/bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK final validate-pkg "required core package set installed"
 
 grep -Eq '^[[:space:]]*ttyv8[[:space:]]+.*[[:space:]]on[[:space:]]' /etc/ttys >/dev/null 2>&1
 if ( $status != 0 ) then
-    log_msg ERROR final validate-ttys "/etc/ttys does not enable ttyv8 for xdm"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR final validate-ttys "/etc/ttys does not enable ttyv8 for xdm"
     set EXIT_CODE = ${EXIT_CODE_VALIDATE}
     goto CLEAN_EXIT
 endif
-log_msg OK final validate-ttys "ttyv8 xdm enablement present"
+/bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK final validate-ttys "ttyv8 xdm enablement present"
 
 if ( ! -f /etc/X11/xorg.conf.d/00-keyboard.conf ) then
-    log_msg ERROR final validate-keyboard "keyboard config file missing"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR final validate-keyboard "keyboard config file missing"
     set EXIT_CODE = ${EXIT_CODE_VALIDATE}
     goto CLEAN_EXIT
 endif
-log_msg OK final validate-keyboard "keyboard config file exists"
+/bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK final validate-keyboard "keyboard config file exists"
 
 if ( ! -f "${TARGET_HOME}/.xsession" ) then
-    log_msg ERROR final validate-session "user session file ${TARGET_HOME}/.xsession missing"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR final validate-session "user session file ${TARGET_HOME}/.xsession missing"
     set EXIT_CODE = ${EXIT_CODE_VALIDATE}
     goto CLEAN_EXIT
 endif
-log_msg OK final validate-session "user session file exists"
+/bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK final validate-session "user session file exists"
 
 grep -Fqx "${MANAGED_BEGIN}" /etc/sysctl.conf >/dev/null 2>&1
 if ( $status != 0 ) then
-    log_msg ERROR final validate-sysctl "managed sysctl block missing"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR final validate-sysctl "managed sysctl block missing"
     set EXIT_CODE = ${EXIT_CODE_VALIDATE}
     goto CLEAN_EXIT
 endif
-log_msg OK final validate-sysctl "managed sysctl block exists"
+/bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK final validate-sysctl "managed sysctl block exists"
 
 if ( -r /dev/sndstat && ${AUDIO_COUNT} > 0 ) then
     grep -Eq "^pcm${SELECTED_AUDIO_UNIT}:" /dev/sndstat >/dev/null 2>&1
     if ( $status != 0 ) then
-        log_msg ERROR final validate-audio "selected default audio device pcm${SELECTED_AUDIO_UNIT} is missing"
+        /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR final validate-audio "selected default audio device pcm${SELECTED_AUDIO_UNIT} is missing"
         set EXIT_CODE = ${EXIT_CODE_VALIDATE}
         goto CLEAN_EXIT
     endif
-    log_msg OK final validate-audio "selected default audio device exists"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK final validate-audio "selected default audio device exists"
 else
-    log_msg WARN final validate-audio "audio device validation skipped because no PCM devices were detected"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN final validate-audio "audio device validation skipped because no PCM devices were detected"
 endif
 
-log_msg OK final validate-log "final summary will be written to log"
-log_msg INFO final summary "gpu_plan=${GPU_PLAN} audio_plan=${AUDIO_PLAN_CLASS} selected_audio_unit=${SELECTED_AUDIO_UNIT} xdm_mode=${XDM_ACTIVATION_MODE}"
+/bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK final validate-log "final summary will be written to log"
+/bin/csh "${LOG_HELPER}" "${LOG_FILE}" INFO final summary "gpu_plan=${GPU_PLAN} audio_plan=${AUDIO_PLAN_CLASS} selected_audio_unit=${SELECTED_AUDIO_UNIT} xdm_mode=${XDM_ACTIVATION_MODE}"
 
 goto CLEAN_EXIT
 
 HANDLE_INTERRUPT:
-log_msg ERROR signal interrupt "received interrupt signal"
+/bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR signal interrupt "received interrupt signal"
 if ( ${ROLLBACK_OCCURRED} == 1 ) then
     set EXIT_CODE = ${EXIT_CODE_ROLLBACK}
 else if ( ${EXIT_CODE} == 0 ) then
@@ -1841,11 +1865,11 @@ log_file=${LOG_FILE}
 EOF
 
 if ( ${EXIT_CODE} == ${EXIT_CODE_SUCCESS} ) then
-    log_msg OK final exit "success; fully converged with no reboot required"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" OK final exit "success; fully converged with no reboot required"
 else if ( ${EXIT_CODE} == ${EXIT_CODE_REBOOT} ) then
-    log_msg WARN final exit "success with reboot or relogin required"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" WARN final exit "success with reboot or relogin required"
 else
-    log_msg ERROR final exit "run failed with exit code ${EXIT_CODE}"
+    /bin/csh "${LOG_HELPER}" "${LOG_FILE}" ERROR final exit "run failed with exit code ${EXIT_CODE}"
 endif
 
 if ( -e "${LOCK_FILE}" ) /bin/rm -f "${LOCK_FILE}"
