@@ -1,9 +1,5 @@
 #!/bin/csh -f
-#
-# turkishvan-bsd.csh
-# draft v1 implementation specification
 # csh-only provisioning and convergence for DragonFlyBSD desktop use
-#
 
 umask 022
 set path = ( /usr/local/sbin /usr/local/bin /sbin /bin /usr/sbin /usr/bin )
@@ -74,7 +70,7 @@ set XORG_BIN = ""
 set GNUSTEP_ENV = ""
 set XKB_RULES_FILE = ""
 
-alias log_msg 'set _ts=`date -u "+%Y-%m-%dT%H:%M:%SZ"`; set _line="${_ts} \!:1 \!:2 \!:3 \!:4-*"; /bin/echo "${_line}"; if ( $?LOG_FILE ) /bin/echo "${_line}" >>! "${LOG_FILE}"'
+alias log_msg 'set _ts=`date -u "+%Y-%m-%dT%H:%M:%SZ"`; set _line="${_ts} \!:1 \!:2 \!:3 \!:4*"; /bin/echo "${_line}"; if ( $?LOG_FILE ) /bin/echo "${_line}" >>! "${LOG_FILE}"'
 alias mark_checkpoint 'if ( ! -e "${CHECKPOINT_FILE}" ) /usr/bin/touch "${CHECKPOINT_FILE}"; grep -qx "\!:1" "${CHECKPOINT_FILE}" >/dev/null 2>&1; if ( $status != 0 ) /bin/echo "\!:1" >>! "${CHECKPOINT_FILE}"'
 
 #
