@@ -10,8 +10,12 @@ set script_name = "$0:t"
 set src = "./tkvnbsd.zig"
 set out = "./tkvnbsd"
 
-if ( $#argv >= 1 ) set src = "$argv[1]"
-if ( $#argv >= 2 ) set out = "$argv[2]"
+if ( $#argv >= 1 ) then
+    set src = "$argv[1]"
+endif
+if ( $#argv >= 2 ) then
+    set out = "$argv[2]"
+endif
 
 if ( ! -f "$src" ) then
     echo "$script_name: source not found: $src"
@@ -19,7 +23,9 @@ if ( ! -f "$src" ) then
 endif
 
 set need_root = 0
-if ( `id -u` != 0 ) set need_root = 1
+if ( `id -u` != 0 ) then
+    set need_root = 1
+endif
 
 set elevate = ""
 if ( $need_root ) then
@@ -44,7 +50,7 @@ if ( "$os_major" != "16" ) then
     exit 1
 endif
 
-if ( ! -x /usr/sbin/pkg ) then
+if ( ! -x /usr/sbin/pkg && ! -x /usr/local/sbin/pkg ) then
     echo "$script_name: pkg is not installed"
     echo "Install pkg first, then rerun this script."
     exit 1
@@ -70,7 +76,9 @@ if ( ! -f /usr/local/sbin/pkg ) then
 endif
 
 set pkg_cmd = "/usr/local/sbin/pkg"
-if ( ! -x "$pkg_cmd" ) set pkg_cmd = "/usr/sbin/pkg"
+if ( ! -x "$pkg_cmd" ) then
+    set pkg_cmd = "/usr/sbin/pkg"
+endif
 
 set missing = ()
 foreach p ( zig ncurses )
@@ -137,7 +145,9 @@ if ( "$ncurses_lib" == "" ) then
 endif
 
 set out_dir = "$out:h"
-if ( "$out_dir" == "" ) set out_dir = "."
+if ( "$out_dir" == "" ) then
+    set out_dir = "."
+endif
 if ( ! -d "$out_dir" ) then
     mkdir -p "$out_dir"
     if ( $status != 0 ) then
@@ -153,7 +163,11 @@ echo "==> Output:      $out"
 echo "==> Zig:         $zig_bin"
 echo "==> OS:          $os_name $os_rel"
 echo "==> ncurses lib: $ncurses_lib"
-echo "==> Build command: $build_cmd"
+echo -n "==> Build command:"
+foreach arg ( $build_cmd )
+    echo -n " $arg"
+end
+echo ""
 
 $build_cmd
 if ( $status != 0 ) then
