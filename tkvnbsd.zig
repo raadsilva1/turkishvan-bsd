@@ -484,7 +484,7 @@ fn buildDesktopRcBody(app: *AppState) ![]u8 {
     defer app.allocator.free(kld_line);
 
     return try std.fmt.allocPrint(app.allocator,
-        "dbus_enable=\"YES\"\nhald_enable=\"YES\"\nmixer_enable=\"YES\"\n{s}{s}{s}",
+        "xdm_enable=\"YES\"\ndbus_enable=\"YES\"\nhald_enable=\"YES\"\nmixer_enable=\"YES\"\n{s}{s}{s}",
         .{ webcamd_line, powerd_flags, kld_line },
     );
 }
@@ -510,8 +510,8 @@ fn startServiceIfPresent(app: *AppState, step: Step, name: []const u8) !void {
     try runBestEffort(app, step, "starting desktop service", cmd);
 }
 
-fn ensureTtysXdm(app: *AppState, step: Step) !void {
-    const desired = "ttyv8   \"/usr/local/bin/xdm -nodaemon\"  xterm   on  secure";
+fn ensureTtysXdmDisabled(app: *AppState, step: Step) !void {
+    const desired = "ttyv8   \"/usr/local/bin/xdm -nodaemon\"  xterm   off secure";
     var existing_opt: ?[]u8 = null;
     if (fileExists(TTYS_PATH)) {
         existing_opt = try readFileAlloc(app.allocator, TTYS_PATH, 1024 * 1024);
@@ -1316,18 +1316,16 @@ fn stepDrivers(app: *AppState) !void {
 fn stepXdm(app: *AppState) !void {
     const step: Step = .xdm;
 
-    const disable_rc = try runCommand(app, step, "disabling rc.conf xdm startup to avoid duplicate managers", "sysrc xdm_enable=NO");
-    defer app.allocator.free(disable_rc.out);
-    if (disable_rc.code != 0) {
-        try appendWarning(app, "could not force xdm_enable=NO before ttyv8 setup", .{});
-    }
+    const enable_rc = try runCommand(app, step, "enabling XDM in rc.conf", "sysrc xdm_enable=YES");
+    defer app.allocator.free(enable_rc.out);
+    if (enable_rc.code != 0) return error.XdmEnableFailed;
 
     try ensureDir("/usr/local/etc/X11/xdm");
-    try ensureTtysXdm(app, step);
+    try ensureTtysXdmDisabled(app, step);
 
     const xservers_body =
         \\# BEGIN TKVNBSD
-        \\:0 local /usr/local/bin/X vt9 -nolisten tcp
+        \\:0 local /usr/local/bin/X -nolisten tcp
         \\# END TKVNBSD
     ;
     _ = try writeFileIfDifferent(app, step, XDM_XSERVERS, xservers_body);
@@ -1350,18 +1348,17 @@ fn stepXdm(app: *AppState) !void {
         \\if [ -r "$HOME/.xinitrc" ]; then
         \\    exec /bin/sh "$HOME/.xinitrc"
         \\fi
-        \\exec vtwm
+        \\exec /usr/local/bin/vtwm
         \\# END TKVNBSD
     ;
     _ = try writeFileIfDifferent(app, step, XDM_XSESSION, xsession_body);
     try ensureExecutable(app, step, XDM_XSESSION);
 
-    try appendWarning(app, "xdm is configured through /etc/ttys ttyv8 plus Xservers/Xsession; reboot to let init start it cleanly", .{});
+    try appendWarning(app, "xdm is configured through rc.conf xdm_enable=YES with managed Xservers/Xsession; ttyv8 xdm entry was forced off to avoid duplicate startup methods", .{});
 
     app.last_completed = .xdm;
     try saveState(app, .xdm);
 }
-
 fn stepVtwm(app: *AppState) !void {
     const step: Step = .vtwm;
     const home = app.home_dir.?;
@@ -1378,9 +1375,11 @@ fn stepVtwm(app: *AppState) !void {
         \\#!/bin/sh
         \\# BEGIN TKVNBSD
         \\export LANG="${LANG:-C.UTF-8}"
-        \\[ -f "$HOME/.Xdefaults" ] && xrdb -merge "$HOME/.Xdefaults"
-        \\command -v dbus-launch >/dev/null 2>&1 && exec dbus-launch --exit-with-session vtwm
-        \\exec vtwm
+        \\[ -f "$HOME/.Xdefaults" ] && /usr/local/bin/xrdb -merge "$HOME/.Xdefaults"
+        \\if [ -x /usr/local/bin/dbus-launch ]; then
+        \\    exec /usr/local/bin/dbus-launch --exit-with-session /usr/local/bin/vtwm
+        \\fi
+        \\exec /usr/local/bin/vtwm
         \\# END TKVNBSD
     ;
     const changed_xsession = try ensureManagedOrMissingFile(app, step, xsession_path, session_body);
@@ -1449,10 +1448,18 @@ fn stepValidate(app: *AppState) !ValidationResult {
     try requirePkg(app, &vr, "xdm");
     try requirePkg(app, &vr, "vtwm");
 
-    if (!(try fileContains(TTYS_PATH, "ttyv8   \"/usr/local/bin/xdm -nodaemon\"  xterm   on  secure", app.allocator))) {
-        vr.ok = false;
+    {
+        const res = try runCommand(app, step, "checking xdm_enable", "sysrc -n xdm_enable");
+        defer app.allocator.free(res.out);
+        if (!std.mem.eql(u8, trimAscii(res.out), "YES")) {
+            vr.ok = false;
+            vr.warnings += 1;
+            try appendWarning(app, "xdm_enable is not YES in rc.conf", .{});
+        }
+    }
+    if (try fileContains(TTYS_PATH, "ttyv8   \"/usr/local/bin/xdm -nodaemon\"  xterm   on  secure", app.allocator)) {
         vr.warnings += 1;
-        try appendWarning(app, "ttyv8 xdm entry is missing or disabled in /etc/ttys", .{});
+        try appendWarning(app, "ttyv8 xdm entry is still enabled; rc.conf-based startup may conflict with tty-based startup", .{});
     }
 
     const xsession_path = try std.fmt.allocPrint(app.allocator, "{s}/.xsession", .{app.home_dir.?});
@@ -1484,7 +1491,7 @@ fn stepValidate(app: *AppState) !ValidationResult {
         vr.ok = false;
         vr.warnings += 1;
         try appendWarning(app, "xdm Xservers is missing: {s}", .{XDM_XSERVERS});
-    } else if (!(try fileContains(XDM_XSERVERS, "/usr/local/bin/X vt9", app.allocator))) {
+    } else if (!(try fileContains(XDM_XSERVERS, ":0 local /usr/local/bin/X -nolisten tcp", app.allocator))) {
         vr.ok = false;
         vr.warnings += 1;
         try appendWarning(app, "xdm Xservers does not contain the managed local display entry", .{});
@@ -1610,7 +1617,7 @@ fn resultScreen(app: *AppState, vr: ValidationResult) void {
     uiPrintf(4, 4, "Warnings: {d}", .{app.warnings.items.len});
     uiPrintf(5, 4, "Packages installed successfully this run: {d}", .{app.installed_packages.items.len});
     uiPrint(7, 4, "Stages completed: preflight, detect, sysctl, packages, drivers, xdm, vtwm, validate");
-    uiPrint(8, 4, "Desktop post-config applied: sysctl profile, powerd, desktop groups, Xorg input/layout, graphics modules, ttyv8/XDM wiring, Xservers, vtwm user session.");
+    uiPrint(8, 4, "Desktop post-config applied: sysctl profile, powerd, desktop groups, Xorg input/layout, graphics modules, rc.conf XDM enablement, managed Xservers/Xsession, vtwm user session.");
     uiPrint(9, 4, "Installed packages:");
 
     const start_row: i32 = 10;
