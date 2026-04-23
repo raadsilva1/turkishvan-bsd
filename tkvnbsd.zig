@@ -534,8 +534,7 @@ fn ensureAllTtysXdmDisabled(app: *AppState, step: Step) !void {
     var out = std.array_list.Managed(u8).init(app.allocator);
     defer out.deinit();
 
-    var lines = std.mem.splitScalar(u8, existing, '
-');
+    var lines = std.mem.splitScalar(u8, existing, '\n');
     while (lines.next()) |line| {
         const trimmed_left = std.mem.trimLeft(u8, line, " 	");
         if (std.mem.startsWith(u8, trimmed_left, "ttyv") and std.mem.indexOf(u8, trimmed_left, "/usr/local/bin/xdm -nodaemon") != null) {
@@ -543,11 +542,9 @@ fn ensureAllTtysXdmDisabled(app: *AppState, step: Step) !void {
             const tty_name = fields.next() orelse "ttyv8";
             const new_line = try std.fmt.allocPrint(app.allocator, "{s}   \"/usr/local/bin/xdm -nodaemon\"  xterm   off secure", .{tty_name});
             defer app.allocator.free(new_line);
-            try out.writer().print("{s}
-", .{new_line});
+            try out.writer().print("{s}\n", .{new_line});
         } else if (line.len > 0) {
-            try out.writer().print("{s}
-", .{line});
+            try out.writer().print("{s}\n", .{line});
         }
     }
 
@@ -564,8 +561,7 @@ fn anyTtysXdmEntryEnabled(app: *AppState) !bool {
     const content = try readFileAlloc(app.allocator, TTYS_PATH, 1024 * 1024);
     defer app.allocator.free(content);
 
-    var lines = std.mem.splitScalar(u8, content, '
-');
+    var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         const trimmed_left = std.mem.trimLeft(u8, line, " 	");
         if (trimmed_left.len == 0 or trimmed_left[0] == '#') continue;
