@@ -17,6 +17,7 @@ const RC_CONF = "/etc/rc.conf";
 const LOADER_CONF = "/boot/loader.conf";
 const XKB_CONF = "/usr/local/etc/X11/xorg.conf.d/00-keyboard-tkvnbsd.conf";
 const LIBINPUT_CONF = "/usr/local/etc/X11/xorg.conf.d/20-libinput-tkvnbsd.conf";
+const GPU_CONF = "/usr/local/etc/X11/xorg.conf.d/90-video-tkvnbsd.conf";
 const XDM_XSETUP = "/usr/local/etc/X11/xdm/Xsetup_0";
 const XDM_XSESSION = "/usr/local/etc/X11/xdm/Xsession";
 const XDM_XSERVERS = "/usr/local/etc/X11/xdm/Xservers";
@@ -152,7 +153,6 @@ const pkgs_input = [_][]const u8{
 
 const pkgs_video_intel = [_][]const u8{
     "drm-kmod",
-    "xf86-video-intel",
 };
 
 const pkgs_video_amd = [_][]const u8{
@@ -1312,9 +1312,44 @@ fn loaderBodyForGpu(gpu: GpuVendor) []const u8 {
     };
 }
 
+
+fn buildGpuDeviceBody(app: *AppState) ![]u8 {
+    return switch (app.hw.gpu) {
+        .intel => try std.fmt.allocPrint(app.allocator,
+            \\Section "Device"
+            \\    Identifier "tkvnbsd intel modesetting"
+            \\    Driver "modesetting"
+            \\EndSection
+        , .{}),
+        .vm => try std.fmt.allocPrint(app.allocator,
+            \\Section "Device"
+            \\    Identifier "tkvnbsd vm video"
+            \\    Driver "vesa"
+            \\EndSection
+        , .{}),
+        .unknown => try std.fmt.allocPrint(app.allocator,
+            \\Section "Device"
+            \\    Identifier "tkvnbsd generic video"
+            \\    Driver "scfb"
+            \\EndSection
+        , .{}),
+        else => try app.allocator.dupe(u8, ""),
+    };
+}
+
 fn stepDrivers(app: *AppState) !void {
     const step: Step = .drivers;
     try installPackageList(app, step, "installing video driver packages", videoPkgList(app.hw));
+
+    if (app.hw.gpu == .intel and try pkgInstalled(app, "xf86-video-intel")) {
+        const del = try runCommandMonitored(app, step, "removing legacy Intel Xorg driver", "env ASSUME_ALWAYS_YES=yes BATCH=yes pkg delete -y xf86-video-intel");
+        defer app.allocator.free(del.out);
+        if (del.code != 0) {
+            try appendWarning(app, "failed to remove legacy xf86-video-intel package; Intel UHD should use drm-kmod with modesetting", .{});
+        } else {
+            try writeLog(app, step, "removed legacy xf86-video-intel package to prefer modesetting");
+        }
+    }
 
     const rc_body = try buildDesktopRcBody(app);
     defer app.allocator.free(rc_body);
@@ -1350,6 +1385,12 @@ fn stepDrivers(app: *AppState) !void {
     ;
     _ = try writeFileIfDifferent(app, step, LIBINPUT_CONF, libinput_body);
 
+    const gpu_body = try buildGpuDeviceBody(app);
+    defer app.allocator.free(gpu_body);
+    if (gpu_body.len > 0) {
+        _ = try writeFileIfDifferent(app, step, GPU_CONF, gpu_body);
+    }
+
     try ensureUserInGroup(app, step, "video");
     if (try pkgInstalled(app, "webcamd")) {
         try ensureOptionalGroup(app, step, "webcamd");
@@ -1373,6 +1414,9 @@ fn stepDrivers(app: *AppState) !void {
     }
     if (app.hw.gpu == .unknown) {
         try appendWarning(app, "unknown GPU; generic X11 video path selected", .{});
+    }
+    if (app.hw.gpu == .intel) {
+        try appendWarning(app, "Intel graphics configured for drm-kmod + modesetting; legacy xf86-video-intel is removed when present because it can conflict with modern Intel UHD setups", .{});
     }
 
     app.last_completed = .drivers;
@@ -1557,6 +1601,15 @@ fn stepProbe(app: *AppState) !void {
     defer app.allocator.free(xservers_expect);
     _ = try probeFileContains(app, "XDM Xservers local display entry", XDM_XSERVERS, xservers_expect);
     _ = try probeFileContains(app, "XDM Xsession launches vtwm", XDM_XSESSION, "/usr/local/bin/vtwm");
+    if (app.hw.gpu == .intel) {
+        _ = try probeFileExists(app, "Intel modesetting config present", GPU_CONF);
+        _ = try probeFileContains(app, "Intel modesetting config selects modesetting", GPU_CONF, "Driver \"modesetting\"");
+        if (try pkgInstalled(app, "xf86-video-intel")) {
+            try appendProbeNote(app, "[warn] legacy xf86-video-intel is still installed; Intel UHD should prefer modesetting", .{});
+        } else {
+            try appendProbeNote(app, "[ok] legacy xf86-video-intel is not installed", .{});
+        }
+    }
 
     const user_xsession = try std.fmt.allocPrint(app.allocator, "{s}/.xsession", .{app.home_dir.?});
     defer app.allocator.free(user_xsession);
@@ -1666,6 +1719,17 @@ fn stepValidate(app: *AppState) !ValidationResult {
         vr.ok = false;
         vr.warnings += 1;
         try appendWarning(app, "target user is not in video group", .{});
+    }
+    if (app.hw.gpu == .intel) {
+        if (!fileExists(GPU_CONF) or !(try fileContains(GPU_CONF, "Driver \"modesetting\"", app.allocator))) {
+            vr.ok = false;
+            vr.warnings += 1;
+            try appendWarning(app, "Intel graphics is missing the managed modesetting device config", .{});
+        }
+        if (try pkgInstalled(app, "xf86-video-intel")) {
+            vr.warnings += 1;
+            try appendWarning(app, "legacy xf86-video-intel is still installed; Intel UHD should prefer drm-kmod + modesetting", .{});
+        }
     }
     if (try pkgInstalled(app, "webcamd") and !(try groupHasUser(app, "webcamd"))) {
         vr.ok = false;
@@ -1789,7 +1853,7 @@ fn resultScreen(app: *AppState, vr: ValidationResult) void {
     uiPrintf(5, 4, "Packages installed successfully this run: {d}", .{app.installed_packages.items.len});
     uiPrintf(6, 4, "Package checksum verification: {s}", .{if (app.checksum_enabled) "enabled" else "disabled"});
     uiPrint(8, 4, "Stages completed: preflight, detect, sysctl, packages, drivers, xdm, vtwm, probe, validate");
-    uiPrint(9, 4, "Desktop post-config applied: sysctl profile, powerd, desktop groups, Xorg input/layout, graphics modules, rc.conf XDM enablement with empty xdm_flags, managed Xservers/Xsession pinned to a visible vt, vtwm user session.");
+    uiPrint(9, 4, "Desktop post-config applied: sysctl profile, powerd, desktop groups, Xorg input/layout, graphics modules, rc.conf XDM enablement with empty xdm_flags, managed Xservers/Xsession pinned to a visible vt, vtwm user session, and Intel modesetting when detected.");
     uiPrint(10, 4, "Validation / simulation checks:");
     var row: i32 = 11;
     if (app.probe_notes.items.len == 0) {
