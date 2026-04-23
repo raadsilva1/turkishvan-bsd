@@ -189,11 +189,17 @@ const pkgs_multimedia = [_][]const u8{
 const safe_sysctls = [_]SysctlEntry{
     .{ .key = "kern.ipc.shm_allow_removed", .value = "1" },
     .{ .key = "hw.snd.maxautovchans", .value = "2" },
+    .{ .key = "vfs.usermount", .value = "1" },
+    .{ .key = "net.local.stream.recvspace", .value = "65536" },
+    .{ .key = "net.local.stream.sendspace", .value = "65536" },
 };
 
 const desktop_sysctls = [_]SysctlEntry{
     .{ .key = "kern.ipc.shm_allow_removed", .value = "1" },
     .{ .key = "hw.snd.maxautovchans", .value = "4" },
+    .{ .key = "vfs.usermount", .value = "1" },
+    .{ .key = "net.local.stream.recvspace", .value = "131072" },
+    .{ .key = "net.local.stream.sendspace", .value = "131072" },
 };
 
 fn stepName(step: Step) []const u8 {
@@ -446,6 +452,33 @@ fn groupHasUser(app: *AppState, group: []const u8) !bool {
         if (std.mem.eql(u8, tok, group)) return true;
     }
     return false;
+}
+
+fn groupExists(allocator: Allocator, group: []const u8) !bool {
+    const cmd = try std.fmt.allocPrint(allocator, "pw groupshow {s}", .{group});
+    defer allocator.free(cmd);
+    const res = try runCapture(allocator, cmd);
+    defer allocator.free(res.out);
+    return res.code == 0;
+}
+
+fn ensureOptionalGroup(app: *AppState, step: Step, group: []const u8) !void {
+    if (!(try groupExists(app.allocator, group))) return;
+    try ensureUserInGroup(app, step, group);
+}
+
+fn buildDesktopRcBody(app: *AppState) ![]u8 {
+    const webcamd_enabled = try pkgInstalled(app, "webcamd");
+    const webcamd_line = if (webcamd_enabled) "webcamd_enable=\"YES\"\n" else "";
+    const powerd_flags = if (app.hw.machine == .laptop)
+        "powerd_enable=\"YES\"\npowerd_flags=\"-a hiadaptive -b adaptive -i 25 -r 85 -N\"\n"
+    else
+        "powerd_enable=\"YES\"\npowerd_flags=\"-a hiadaptive -n hiadaptive -i 25 -r 85 -N\"\n";
+
+    return try std.fmt.allocPrint(app.allocator,
+        "dbus_enable=\"YES\"\nhald_enable=\"YES\"\nmixer_enable=\"YES\"\n{s}{s}",
+        .{ webcamd_line, powerd_flags },
+    );
 }
 
 fn driverModuleName(gpu: GpuVendor) ?[]const u8 {
@@ -1176,11 +1209,8 @@ fn stepDrivers(app: *AppState) !void {
     const step: Step = .drivers;
     try installPackageList(app, step, "installing video driver packages", videoPkgList(app.hw));
 
-    const rc_body =
-        \\dbus_enable="YES"
-        \\hald_enable="YES"
-        \\mixer_enable="YES"
-    ;
+    const rc_body = try buildDesktopRcBody(app);
+    defer app.allocator.free(rc_body);
     _ = try replaceManagedBlock(app, step, RC_CONF, rc_body);
 
     const loader_body = loaderBodyForGpu(app.hw.gpu);
@@ -1214,6 +1244,10 @@ fn stepDrivers(app: *AppState) !void {
     _ = try writeFileIfDifferent(app, step, LIBINPUT_CONF, libinput_body);
 
     try ensureUserInGroup(app, step, "video");
+    if (try pkgInstalled(app, "webcamd")) {
+        try ensureOptionalGroup(app, step, "webcamd");
+        try runBestEffort(app, step, "loading cuse module for webcamd", "kldstat -m cuse >/dev/null 2>&1 || kldload cuse");
+    }
 
     if (driverModuleName(app.hw.gpu)) |modname| {
         const kld_cmd = try std.fmt.allocPrint(app.allocator, "kldstat -m {s} >/dev/null 2>&1 || kldload {s}", .{ modname, modname });
@@ -1224,6 +1258,8 @@ fn stepDrivers(app: *AppState) !void {
     try startServiceIfPresent(app, step, "dbus");
     try startServiceIfPresent(app, step, "hald");
     try startServiceIfPresent(app, step, "mixer");
+    try startServiceIfPresent(app, step, "powerd");
+    if (try pkgInstalled(app, "webcamd")) try startServiceIfPresent(app, step, "webcamd");
 
     if (!app.hw.audio_present) {
         try appendWarning(app, "no audio device detected; audio packages/config were minimized", .{});
@@ -1401,6 +1437,11 @@ fn stepValidate(app: *AppState) !ValidationResult {
         vr.warnings += 1;
         try appendWarning(app, "target user is not in video group", .{});
     }
+    if (try pkgInstalled(app, "webcamd") and !(try groupHasUser(app, "webcamd"))) {
+        vr.ok = false;
+        vr.warnings += 1;
+        try appendWarning(app, "webcamd is installed but target user is not in webcamd group", .{});
+    }
     if (!fileExists(SYSCTL_CONF)) {
         vr.ok = false;
         vr.warnings += 1;
@@ -1418,6 +1459,26 @@ fn stepValidate(app: *AppState) !ValidationResult {
         vr.ok = false;
         vr.warnings += 1;
         try appendWarning(app, "graphics loader block not found in loader.conf", .{});
+    }
+    if (!(try fileContains(SYSCTL_CONF, "vfs.usermount=1", app.allocator))) {
+        vr.ok = false;
+        vr.warnings += 1;
+        try appendWarning(app, "desktop sysctl tuning is missing vfs.usermount=1", .{});
+    }
+    if (!(try fileContains(SYSCTL_CONF, "hw.snd.maxautovchans=", app.allocator))) {
+        vr.ok = false;
+        vr.warnings += 1;
+        try appendWarning(app, "desktop sysctl tuning is missing hw.snd.maxautovchans", .{});
+    }
+    if (!(try fileContains(RC_CONF, "powerd_enable=\"YES\"", app.allocator))) {
+        vr.ok = false;
+        vr.warnings += 1;
+        try appendWarning(app, "powerd is not enabled persistently in rc.conf", .{});
+    }
+    if (!(try fileContains(RC_CONF, "powerd_flags=", app.allocator))) {
+        vr.ok = false;
+        vr.warnings += 1;
+        try appendWarning(app, "powerd flags are missing from rc.conf", .{});
     }
 
     const pkg_check = try runCommand(app, step, "checking installed package checksums", "pkg check -q -s -a");
@@ -1483,7 +1544,7 @@ fn resultScreen(app: *AppState, vr: ValidationResult) void {
     uiPrintf(4, 4, "Warnings: {d}", .{app.warnings.items.len});
     uiPrintf(5, 4, "Packages installed successfully this run: {d}", .{app.installed_packages.items.len});
     uiPrint(7, 4, "Stages completed: preflight, detect, sysctl, packages, drivers, xdm, vtwm, validate");
-    uiPrint(8, 4, "Desktop post-config applied: Xorg input/layout, graphics module enablement, XDM session wiring, vtwm user session.");
+    uiPrint(8, 4, "Desktop post-config applied: sysctl profile, powerd, desktop groups, Xorg input/layout, graphics modules, XDM session wiring, vtwm user session.");
     uiPrint(9, 4, "Installed packages:");
 
     const start_row: i32 = 10;
