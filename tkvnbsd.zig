@@ -338,7 +338,7 @@ fn appendInstalledPackage(app: *AppState, pkg: []const u8) !void {
     try app.installed_packages.append(try app.allocator.dupe(u8, pkg));
 }
 
-fn packageFailurePrompt(app: *AppState, pkg: []const u8, detail: []const u8) PackageDecision {
+fn packageFailurePrompt(pkg: []const u8, detail: []const u8) PackageDecision {
     drawFrame("tkvnbsd - package failure");
     uiPrintf(3, 4, "Package failed: {s}", .{pkg});
     uiPrintf(4, 4, "Log: {s}", .{LOG_PATH});
