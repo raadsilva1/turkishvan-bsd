@@ -93,12 +93,12 @@ const AppState = struct {
     current_command_len: usize = 0,
     last_status: [256]u8 = [_]u8{0} ** 256,
     last_status_len: usize = 0,
-    warnings: std.ArrayList([]u8),
+    warnings: std.array_list.Managed([]u8),
 
     fn init(allocator: Allocator) AppState {
         return .{
             .allocator = allocator,
-            .warnings = std.ArrayList([]u8).init(allocator),
+            .warnings = std.array_list.Managed([]u8).init(allocator),
         };
     }
 
@@ -376,7 +376,7 @@ fn replaceManagedBlock(app: *AppState, step: Step, path: []const u8, body: []con
     const desired_block = try std.fmt.allocPrint(app.allocator, "{s}\n{s}\n{s}\n", .{ MarkerBegin, trimAscii(body), MarkerEnd });
     defer app.allocator.free(desired_block);
 
-    var out = std.ArrayList(u8).init(app.allocator);
+    var out = std.array_list.Managed(u8).init(app.allocator);
     defer out.deinit();
 
     if (existing.len == 0) {
@@ -452,13 +452,15 @@ fn writeLog(app: *AppState, step: Step, message: []const u8) !void {
 }
 
 fn runCapture(allocator: Allocator, command: []const u8) !CmdResult {
-    const wrapped = try std.fmt.allocPrintZ(allocator, "{s} 2>&1", .{command});
+    const wrapped_tmp = try std.fmt.allocPrint(allocator, "{s} 2>&1", .{command});
+    defer allocator.free(wrapped_tmp);
+    const wrapped = try allocator.dupeZ(u8, wrapped_tmp);
     defer allocator.free(wrapped);
 
     const fp = c.popen(wrapped.ptr, "r");
     if (fp == null) return error.POpenFailed;
 
-    var out = std.ArrayList(u8).init(allocator);
+    var out = std.array_list.Managed(u8).init(allocator);
     var buf: [512]u8 = undefined;
     while (c.fgets(@as([*c]u8, @ptrCast(&buf)), @as(c_int, @intCast(buf.len)), fp) != null) {
         const line = std.mem.span(@as([*:0]u8, @ptrCast(&buf)));
@@ -467,7 +469,7 @@ fn runCapture(allocator: Allocator, command: []const u8) !CmdResult {
 
     const status = c.pclose(fp);
     var code: i32 = status;
-    if (status >= 0) code = (status >> 8) & 0xff;
+    if (c.WIFEXITED(status) != 0) code = c.WEXITSTATUS(status);
     return .{ .code = code, .out = try out.toOwnedSlice() };
 }
 
@@ -630,7 +632,7 @@ fn screenSummary(app: *AppState, resume_from: Step) bool {
 }
 
 fn saveState(app: *AppState, step: Step) !void {
-    var data = std.ArrayList(u8).init(app.allocator);
+    var data = std.array_list.Managed(u8).init(app.allocator);
     defer data.deinit();
     if (app.username) |u| try data.writer().print("username={s}\n", .{u});
     if (app.keyboard) |k| try data.writer().print("keyboard={s}\n", .{k});
@@ -731,7 +733,7 @@ fn stepDetect(app: *AppState) !void {
 
 fn buildSysctlBody(app: *AppState) ![]u8 {
     const entries = if (std.mem.eql(u8, app.hw.profile(), "safe")) safe_sysctls[0..] else desktop_sysctls[0..];
-    var body = std.ArrayList(u8).init(app.allocator);
+    var body = std.array_list.Managed(u8).init(app.allocator);
     errdefer body.deinit();
     try body.writer().print("# managed desktop tuning profile: {s}\n", .{app.hw.profile()});
     for (entries) |entry| {
@@ -789,7 +791,7 @@ fn pkgInstalled(app: *AppState, pkg: []const u8) !bool {
 }
 
 fn installPackageList(app: *AppState, step: Step, label: []const u8, list: []const []const u8) !void {
-    var needed = std.ArrayList([]const u8).init(app.allocator);
+    var needed = std.array_list.Managed([]const u8).init(app.allocator);
     defer needed.deinit();
     for (list) |pkg| {
         if (!(try pkgInstalled(app, pkg))) try needed.append(pkg);
@@ -801,7 +803,7 @@ fn installPackageList(app: *AppState, step: Step, label: []const u8, list: []con
         return;
     }
 
-    var cmd = std.ArrayList(u8).init(app.allocator);
+    var cmd = std.array_list.Managed(u8).init(app.allocator);
     defer cmd.deinit();
     try cmd.appendSlice("env ASSUME_ALWAYS_YES=yes pkg install -y");
     for (needed.items) |pkg| {
@@ -1068,16 +1070,14 @@ fn retryOrQuit(app: *AppState, failed_step: Step, err_name: []const u8) bool {
 
 fn runStepWithRetry(app: *AppState, step: Step) !void {
     while (true) {
-        const step_result = switch (step) {
+        switch (step) {
             .sysctl => stepSysctl(app),
             .packages => stepPackages(app),
             .drivers => stepDrivers(app),
             .xdm => stepXdm(app),
             .vtwm => stepVtwm(app),
             else => return,
-        };
-
-        step_result catch |err| {
+        } catch |err| {
             const name = @errorName(err);
             const msg = try std.fmt.allocPrint(app.allocator, "step {s} error: {s}", .{ stepName(step), name });
             defer app.allocator.free(msg);
@@ -1085,7 +1085,6 @@ fn runStepWithRetry(app: *AppState, step: Step) !void {
             if (!retryOrQuit(app, step, name)) return err;
             continue;
         };
-
         return;
     }
 }
