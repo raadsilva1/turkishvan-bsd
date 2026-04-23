@@ -485,7 +485,7 @@ fn buildDesktopRcBody(app: *AppState) ![]u8 {
     defer app.allocator.free(kld_line);
 
     return try std.fmt.allocPrint(app.allocator,
-        "xdm_enable=\"YES\"\ndbus_enable=\"YES\"\nhald_enable=\"YES\"\nmixer_enable=\"YES\"\n{s}{s}{s}",
+        "xdm_enable=\"NO\"\ndbus_enable=\"YES\"\nhald_enable=\"YES\"\nmixer_enable=\"YES\"\n{s}{s}{s}",
         .{ webcamd_line, powerd_flags, kld_line },
     );
 }
@@ -511,8 +511,33 @@ fn startServiceIfPresent(app: *AppState, step: Step, name: []const u8) !void {
     try runBestEffort(app, step, "starting desktop service", cmd);
 }
 
-fn ensureTtysXdmDisabled(app: *AppState, step: Step) !void {
-    const desired = "ttyv8   \"/usr/local/bin/xdm -nodaemon\"  xterm   off secure";
+fn highestConfiguredVt(app: *AppState) !u32 {
+    if (!fileExists(TTYS_PATH)) return 8;
+    const content = try readFileAlloc(app.allocator, TTYS_PATH, 1024 * 1024);
+    defer app.allocator.free(content);
+
+    var max_vt: u32 = 0;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed_left = std.mem.trimLeft(u8, line, " \t");
+        if (!std.mem.startsWith(u8, trimmed_left, "ttyv")) continue;
+        var idx: usize = 4;
+        while (idx < trimmed_left.len and std.ascii.isDigit(trimmed_left[idx])) : (idx += 1) {}
+        if (idx == 4) continue;
+        const n = std.fmt.parseInt(u32, trimmed_left[4..idx], 10) catch continue;
+        if (n > max_vt) max_vt = n;
+    }
+    if (max_vt == 0) return 8;
+    return max_vt;
+}
+
+fn ensureLastVtXdmEnabled(app: *AppState, step: Step) !void {
+    const vt_num = try highestConfiguredVt(app);
+    const target = try std.fmt.allocPrint(app.allocator, "ttyv{d}", .{vt_num});
+    defer app.allocator.free(target);
+    const desired = try std.fmt.allocPrint(app.allocator, "{s}   \"/usr/local/bin/xdm -nodaemon\"  xterm   on  secure", .{target});
+    defer app.allocator.free(desired);
+
     var existing_opt: ?[]u8 = null;
     if (fileExists(TTYS_PATH)) {
         existing_opt = try readFileAlloc(app.allocator, TTYS_PATH, 1024 * 1024);
@@ -527,7 +552,7 @@ fn ensureTtysXdmDisabled(app: *AppState, step: Step) !void {
     var lines = std.mem.splitScalar(u8, existing, '\n');
     while (lines.next()) |line| {
         const trimmed_left = std.mem.trimLeft(u8, line, " \t");
-        if (std.mem.startsWith(u8, trimmed_left, "ttyv8")) {
+        if (std.mem.startsWith(u8, trimmed_left, target)) {
             try out.writer().print("{s}\n", .{desired});
             found = true;
         } else if (line.len > 0) {
@@ -542,6 +567,22 @@ fn ensureTtysXdmDisabled(app: *AppState, step: Step) !void {
     if (existing.len > 0 and std.mem.eql(u8, trimAscii(existing), trimAscii(new_content))) return;
     try backupFile(app, TTYS_PATH, step);
     try writeFile(TTYS_PATH, new_content);
+}
+
+fn anyTtysXdmEntryEnabled(app: *AppState) !bool {
+    if (!fileExists(TTYS_PATH)) return false;
+    const content = try readFileAlloc(app.allocator, TTYS_PATH, 1024 * 1024);
+    defer app.allocator.free(content);
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed_left = std.mem.trimLeft(u8, line, " \t");
+        if (trimmed_left.len == 0 or trimmed_left[0] == '#') continue;
+        if (std.mem.indexOf(u8, trimmed_left, "/usr/local/bin/xdm -nodaemon") != null and
+            std.mem.indexOf(u8, trimmed_left, " off ") == null)
+            return true;
+    }
+    return false;
 }
 
 fn fileContains(path: []const u8, needle: []const u8, allocator: Allocator) !bool {
@@ -1330,12 +1371,12 @@ fn stepDrivers(app: *AppState) !void {
 fn stepXdm(app: *AppState) !void {
     const step: Step = .xdm;
 
-    const enable_rc = try runCommand(app, step, "enabling XDM in rc.conf", "sysrc xdm_enable=YES");
-    defer app.allocator.free(enable_rc.out);
-    if (enable_rc.code != 0) return error.XdmEnableFailed;
+    const disable_rc = try runCommand(app, step, "disabling rc.conf XDM startup in favor of tty startup", "sysrc xdm_enable=NO");
+    defer app.allocator.free(disable_rc.out);
+    if (disable_rc.code != 0) return error.XdmEnableFailed;
 
     try ensureDir("/usr/local/etc/X11/xdm");
-    try ensureTtysXdmDisabled(app, step);
+    try ensureLastVtXdmEnabled(app, step);
 
     const xservers_body =
         \\# BEGIN TKVNBSD
@@ -1368,7 +1409,8 @@ fn stepXdm(app: *AppState) !void {
     _ = try writeFileIfDifferent(app, step, XDM_XSESSION, xsession_body);
     try ensureExecutable(app, step, XDM_XSESSION);
 
-    try appendWarning(app, "xdm is configured through rc.conf xdm_enable=YES with managed Xservers/Xsession; ttyv8 xdm entry was forced off to avoid duplicate startup methods", .{});
+    const vt_num = try highestConfiguredVt(app);
+    try appendWarning(app, "xdm is configured for zero-interaction boot on the highest configured virtual terminal ttyv{d}; rc.conf xdm startup was disabled to avoid conflicting startup methods", .{vt_num});
 
     app.last_completed = .xdm;
     try saveState(app, .xdm);
@@ -1465,15 +1507,25 @@ fn stepValidate(app: *AppState) !ValidationResult {
     {
         const res = try runCommand(app, step, "checking xdm_enable", "sysrc -n xdm_enable");
         defer app.allocator.free(res.out);
-        if (!std.mem.eql(u8, trimAscii(res.out), "YES")) {
-            vr.ok = false;
+        if (!std.mem.eql(u8, trimAscii(res.out), "NO")) {
             vr.warnings += 1;
-            try appendWarning(app, "xdm_enable is not YES in rc.conf", .{});
+            try appendWarning(app, "xdm_enable is not NO in rc.conf; tty-based startup may conflict with rc-based startup", .{});
         }
     }
-    if (try fileContains(TTYS_PATH, "ttyv8   \"/usr/local/bin/xdm -nodaemon\"  xterm   on  secure", app.allocator)) {
+    {
+        const vt_num = try highestConfiguredVt(app);
+        const expected_tty = try std.fmt.allocPrint(app.allocator, "ttyv{d}   \"/usr/local/bin/xdm -nodaemon\"  xterm   on  secure", .{vt_num});
+        defer app.allocator.free(expected_tty);
+        if (!(try fileContains(TTYS_PATH, expected_tty, app.allocator))) {
+            vr.ok = false;
+            vr.warnings += 1;
+            try appendWarning(app, "highest configured virtual terminal is not wired to start xdm automatically", .{});
+        }
+    }
+    if (!(try anyTtysXdmEntryEnabled(app))) {
+        vr.ok = false;
         vr.warnings += 1;
-        try appendWarning(app, "ttyv8 xdm entry is still enabled; rc.conf-based startup may conflict with tty-based startup", .{});
+        try appendWarning(app, "no enabled xdm tty entry was found in /etc/ttys", .{});
     }
 
     const xsession_path = try std.fmt.allocPrint(app.allocator, "{s}/.xsession", .{app.home_dir.?});
@@ -1636,7 +1688,7 @@ fn resultScreen(app: *AppState, vr: ValidationResult) void {
     uiPrintf(5, 4, "Packages installed successfully this run: {d}", .{app.installed_packages.items.len});
     uiPrintf(6, 4, "Package checksum verification: {s}", .{if (app.checksum_enabled) "enabled" else "disabled"});
     uiPrint(8, 4, "Stages completed: preflight, detect, sysctl, packages, drivers, xdm, vtwm, validate");
-    uiPrint(9, 4, "Desktop post-config applied: sysctl profile, powerd, desktop groups, Xorg input/layout, graphics modules, rc.conf XDM enablement, managed Xservers/Xsession, vtwm user session.");
+    uiPrint(9, 4, "Desktop post-config applied: sysctl profile, powerd, desktop groups, Xorg input/layout, graphics modules, highest-VT XDM autostart, managed Xservers/Xsession, vtwm user session.");
     uiPrint(10, 4, "Installed packages:");
 
     const start_row: i32 = 11;
