@@ -1,2 +1,2 @@
 # turkishvan-bsd
-Setting up a complete desktop for DragonFlyBSD
+Setting up a complete desktop for FreeBSD
