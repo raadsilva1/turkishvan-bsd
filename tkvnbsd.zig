@@ -536,9 +536,9 @@ fn ensureAllTtysXdmDisabled(app: *AppState, step: Step) !void {
 
     var lines = std.mem.splitScalar(u8, existing, '\n');
     while (lines.next()) |line| {
-        const trimmed_left = std.mem.trimLeft(u8, line, " 	");
+        const trimmed_left = std.mem.trimLeft(u8, line, " \t");
         if (std.mem.startsWith(u8, trimmed_left, "ttyv") and std.mem.indexOf(u8, trimmed_left, "/usr/local/bin/xdm -nodaemon") != null) {
-            var fields = std.mem.tokenizeAny(u8, trimmed_left, " 	");
+            var fields = std.mem.tokenizeAny(u8, trimmed_left, " \t");
             const tty_name = fields.next() orelse "ttyv8";
             const new_line = try std.fmt.allocPrint(app.allocator, "{s}   \"/usr/local/bin/xdm -nodaemon\"  xterm   off secure", .{tty_name});
             defer app.allocator.free(new_line);
@@ -563,7 +563,7 @@ fn anyTtysXdmEntryEnabled(app: *AppState) !bool {
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
-        const trimmed_left = std.mem.trimLeft(u8, line, " 	");
+        const trimmed_left = std.mem.trimLeft(u8, line, " \t");
         if (trimmed_left.len == 0 or trimmed_left[0] == '#') continue;
         if (std.mem.indexOf(u8, trimmed_left, "/usr/local/bin/xdm -nodaemon") != null and
             std.mem.indexOf(u8, trimmed_left, " off ") == null)
