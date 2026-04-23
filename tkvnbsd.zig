@@ -368,7 +368,7 @@ fn hwGpuReason(hw: HardwareInfo) []const u8 {
 }
 
 fn asciiLowerOwned(allocator: Allocator, src: []const u8) ![]u8 {
-    var out = try allocator.dupe(u8, src);
+    const out = try allocator.dupe(u8, src);
     for (out) |*ch| ch.* = std.ascii.toLower(ch.*);
     return out;
 }
@@ -1463,7 +1463,7 @@ fn stepDetect(app: *AppState) !void {
             setFixed(app.hw.gpu_bus[0..], &app.hw.gpu_bus_len, fixedSlice(primary.bus[0..], primary.bus_len));
 
             if (gpu_count > 1) {
-                var secondary_idx: usize = if (primary_idx == 0) 1 else 0;
+                const secondary_idx: usize = if (primary_idx == 0) 1 else 0;
                 if (secondary_idx < gpu_count) {
                     const secondary = gpus[secondary_idx];
                     app.hw.gpu_secondary = secondary.vendor;
