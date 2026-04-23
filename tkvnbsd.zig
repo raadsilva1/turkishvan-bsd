@@ -422,7 +422,7 @@ fn ensureExecutable(app: *AppState, step: Step, path: []const u8) !void {
     if (res.code != 0) return error.ChmodFailed;
 }
 
-fn pkgIntegrityCheck(app: *AppState, step: Step, pkg: []const u8) !void {
+fn pkgIntegrityCheck(app: *AppState, pkg: []const u8) !void {
     const checksum_cmd = try std.fmt.allocPrint(app.allocator, "pkg check -q -s {s}", .{pkg});
     defer app.allocator.free(checksum_cmd);
     const checksum = try runCapture(app.allocator, checksum_cmd);
@@ -1130,7 +1130,7 @@ fn installPackageList(app: *AppState, step: Step, label: []const u8, list: []con
             if (run.code == 0) {
                 defer app.allocator.free(run.out);
                 try appendInstalledPackage(app, pkg);
-                try pkgIntegrityCheck(app, step, pkg);
+                try pkgIntegrityCheck(app, pkg);
                 break :pkg_attempt;
             }
 
