@@ -77,6 +77,12 @@ const ValidationResult = struct {
     warnings: usize = 0,
 };
 
+const PackageDecision = enum {
+    stop,
+    retry,
+    ignore,
+};
+
 const AppState = struct {
     allocator: Allocator,
     username: ?[]u8 = null,
@@ -94,11 +100,13 @@ const AppState = struct {
     last_status: [256]u8 = [_]u8{0} ** 256,
     last_status_len: usize = 0,
     warnings: std.array_list.Managed([]u8),
+    installed_packages: std.array_list.Managed([]u8),
 
     fn init(allocator: Allocator) AppState {
         return .{
             .allocator = allocator,
             .warnings = std.array_list.Managed([]u8).init(allocator),
+            .installed_packages = std.array_list.Managed([]u8).init(allocator),
         };
     }
 
@@ -108,6 +116,8 @@ const AppState = struct {
         if (self.home_dir) |v| self.allocator.free(v);
         for (self.warnings.items) |w| self.allocator.free(w);
         self.warnings.deinit();
+        for (self.installed_packages.items) |pkg| self.allocator.free(pkg);
+        self.installed_packages.deinit();
     }
 };
 
@@ -318,6 +328,55 @@ fn appendWarning(app: *AppState, comptime fmt: []const u8, args: anytype) !void 
     const msg = try std.fmt.allocPrint(app.allocator, fmt, args);
     try app.warnings.append(msg);
     try writeLog(app, .validate, msg);
+}
+
+
+fn appendInstalledPackage(app: *AppState, pkg: []const u8) !void {
+    for (app.installed_packages.items) |existing| {
+        if (std.mem.eql(u8, existing, pkg)) return;
+    }
+    try app.installed_packages.append(try app.allocator.dupe(u8, pkg));
+}
+
+fn packageFailurePrompt(app: *AppState, pkg: []const u8, detail: []const u8) PackageDecision {
+    drawFrame("tkvnbsd - package failure");
+    uiPrintf(3, 4, "Package failed: {s}", .{pkg});
+    uiPrintf(4, 4, "Log: {s}", .{LOG_PATH});
+    uiPrint(6, 4, "Failure details:");
+
+    var row: i32 = 7;
+    var lines = std.mem.splitScalar(u8, detail, '\n');
+    var shown: usize = 0;
+    while (lines.next()) |line| {
+        const t = trimAscii(line);
+        if (t.len == 0) continue;
+        const clipped = if (t.len > 72) t[0..72] else t;
+        uiPrintf(row, 6, "{s}", .{clipped});
+        row += 1;
+        shown += 1;
+        if (shown >= 8 or row >= c.LINES - 6) break;
+    }
+    if (shown == 0) {
+        uiPrint(row, 6, "No details returned by pkg.");
+        row += 1;
+    }
+
+    uiPrint(c.LINES - 5, 4, "Choose: r retry  i ignore and continue  s stop installation  l show log path");
+    _ = c.refresh();
+
+    while (true) {
+        const ch = c.getch();
+        switch (ch) {
+            'r', 'R', 10, 13, c.KEY_ENTER => return .retry,
+            'i', 'I' => return .ignore,
+            's', 'S', 'q', 'Q' => return .stop,
+            'l', 'L' => {
+                uiPrintf(c.LINES - 4, 4, "Log path: {s}", .{LOG_PATH});
+                _ = c.refresh();
+            },
+            else => {},
+        }
+    }
 }
 
 fn fileExists(path: []const u8) bool {
@@ -935,9 +994,39 @@ fn installPackageList(app: *AppState, step: Step, label: []const u8, list: []con
         defer app.allocator.free(action);
         const cmd = try std.fmt.allocPrint(app.allocator, "env ASSUME_ALWAYS_YES=yes BATCH=yes pkg install -y {s}", .{pkg});
         defer app.allocator.free(cmd);
-        const run = try runCommandMonitored(app, step, action, cmd);
-        defer app.allocator.free(run.out);
-        if (run.code != 0) return error.PackageInstallFailed;
+
+        pkg_attempt: while (true) {
+            const run = try runCommandMonitored(app, step, action, cmd);
+            if (run.code == 0) {
+                defer app.allocator.free(run.out);
+                try appendInstalledPackage(app, pkg);
+                break :pkg_attempt;
+            }
+
+            const decision = packageFailurePrompt(app, pkg, trimAscii(run.out));
+            switch (decision) {
+                .retry => {
+                    app.allocator.free(run.out);
+                    continue :pkg_attempt;
+                },
+                .ignore => {
+                    const msg = try std.fmt.allocPrint(app.allocator, "ignoring failed package install for {s}", .{pkg});
+                    defer app.allocator.free(msg);
+                    try writeLog(app, step, msg);
+                    app.allocator.free(run.out);
+                    setStatus(app, "ignored");
+                    break :pkg_attempt;
+                },
+                .stop => {
+                    const msg = try std.fmt.allocPrint(app.allocator, "user stopped installation at package {s}", .{pkg});
+                    defer app.allocator.free(msg);
+                    try writeLog(app, step, msg);
+                    app.allocator.free(run.out);
+                    setStatus(app, "stopped");
+                    return error.PackageInstallStoppedByUser;
+                },
+            }
+        }
     }
 }
 
@@ -1211,6 +1300,7 @@ fn runStepWithRetry(app: *AppState, step: Step) !void {
             const msg = try std.fmt.allocPrint(app.allocator, "step {s} error: {s}", .{ stepName(step), name });
             defer app.allocator.free(msg);
             try writeLog(app, step, msg);
+            if (err == error.PackageInstallStoppedByUser) return err;
             if (!retryOrQuit(app, step, name)) return err;
             continue;
         };
@@ -1221,26 +1311,30 @@ fn runStepWithRetry(app: *AppState, step: Step) !void {
 
 fn resultScreen(app: *AppState, vr: ValidationResult) void {
     drawFrame("tkvnbsd - result");
-    uiPrintf(4, 4, "Validation: {s}", .{if (vr.ok) "success" else "warnings/failures present"});
-    uiPrintf(5, 4, "Warnings: {d}", .{app.warnings.items.len});
-    uiPrint(7, 4, "Completed items:");
-    uiPrint(8, 6, "- preflight checks");
-    uiPrint(9, 6, "- hardware detection");
-    uiPrint(10, 6, "- sysctl tuning");
-    uiPrint(11, 6, "- package installation");
-    uiPrint(12, 6, "- drivers/input/audio setup");
-    uiPrint(13, 6, "- XDM enablement");
-    uiPrint(14, 6, "- vtwm session setup");
-    var row: i32 = 16;
-    if (app.warnings.items.len > 0) {
-        uiPrint(row, 4, "Warnings:");
-        row += 1;
-        for (app.warnings.items[0..@min(app.warnings.items.len, @as(usize, 6))]) |w| {
-            uiPrintf(row, 6, "- {s}", .{w});
-            row += 1;
+    uiPrintf(3, 4, "Validation: {s}", .{if (vr.ok) "success" else "warnings/failures present"});
+    uiPrintf(4, 4, "Warnings: {d}", .{app.warnings.items.len});
+    uiPrintf(5, 4, "Packages installed successfully this run: {d}", .{app.installed_packages.items.len});
+    uiPrint(7, 4, "Stages completed: preflight, detect, sysctl, packages, drivers, xdm, vtwm, validate");
+    uiPrint(8, 4, "Installed packages:");
+
+    const start_row: i32 = 9;
+    const end_row: i32 = c.LINES - 6;
+    const usable_rows: usize = if (end_row > start_row) @intCast(end_row - start_row + 1) else 1;
+    const col_width: i32 = @divTrunc(c.COLS - 8, 3);
+
+    if (app.installed_packages.items.len == 0) {
+        uiPrint(start_row, 6, "No new packages were installed in this run.");
+    } else {
+        for (app.installed_packages.items, 0..) |pkg, idx| {
+            const row: i32 = start_row + @as(i32, @intCast(idx % usable_rows));
+            const col_idx: i32 = @as(i32, @intCast(idx / usable_rows));
+            if (col_idx >= 3) break;
+            const col: i32 = 6 + col_idx * col_width;
+            uiPrintf(row, col, "- {s}", .{pkg});
         }
     }
-    uiPrint(c.LINES - 4, 4, "A reboot is recommended so loader and service changes take effect. Press q to exit.");
+
+    uiPrint(c.LINES - 4, 4, "Failed packages are not listed here. Check the log file for failures. Press q to exit.");
     _ = c.refresh();
     while (true) {
         const ch = c.getch();
