@@ -342,7 +342,8 @@ fn fixedSlice(buf: []const u8, len: usize) []const u8 {
 
 fn setFixed(buf: []u8, len_ptr: *usize, src: []const u8) void {
     const n = @min(buf.len, src.len);
-    if (n > 0) std.mem.copyForwards(u8, buf[0..n], src[0..n]);
+    var i: usize = 0;
+    while (i < n) : (i += 1) buf[i] = src[i];
     len_ptr.* = n;
     if (n < buf.len) buf[n] = 0;
 }
@@ -630,7 +631,8 @@ fn drawProgress(app: *AppState) void {
 fn setAction(app: *AppState, step: Step, action: []const u8) void {
     app.current_step = step;
     app.current_action_len = @min(app.current_action.len, action.len);
-    std.mem.copyForwards(u8, app.current_action[0..app.current_action_len], action[0..app.current_action_len]);
+    var i: usize = 0;
+    while (i < app.current_action_len) : (i += 1) app.current_action[i] = action[i];
     if (app.current_action_len < app.current_action.len) app.current_action[app.current_action_len] = 0;
     app.current_command_len = 0;
     setStatus(app, "running");
@@ -638,14 +640,16 @@ fn setAction(app: *AppState, step: Step, action: []const u8) void {
 
 fn setCommand(app: *AppState, command: []const u8) void {
     app.current_command_len = @min(app.current_command.len, command.len);
-    std.mem.copyForwards(u8, app.current_command[0..app.current_command_len], command[0..app.current_command_len]);
+    var i: usize = 0;
+    while (i < app.current_command_len) : (i += 1) app.current_command[i] = command[i];
     if (app.current_command_len < app.current_command.len) app.current_command[app.current_command_len] = 0;
     drawProgress(app);
 }
 
 fn setStatus(app: *AppState, status: []const u8) void {
     app.last_status_len = @min(app.last_status.len, status.len);
-    std.mem.copyForwards(u8, app.last_status[0..app.last_status_len], status[0..app.last_status_len]);
+    var i: usize = 0;
+    while (i < app.last_status_len) : (i += 1) app.last_status[i] = status[i];
     if (app.last_status_len < app.last_status.len) app.last_status[app.last_status_len] = 0;
     drawProgress(app);
 }
