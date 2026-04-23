@@ -48,6 +48,7 @@ const Step = enum {
     drivers,
     xdm,
     vtwm,
+    probe,
     validate,
     done,
 };
@@ -104,6 +105,7 @@ const AppState = struct {
     last_status_len: usize = 0,
     warnings: std.array_list.Managed([]u8),
     installed_packages: std.array_list.Managed([]u8),
+    probe_notes: std.array_list.Managed([]u8),
     checksum_enabled: bool = true,
 
     fn init(allocator: Allocator) AppState {
@@ -111,6 +113,7 @@ const AppState = struct {
             .allocator = allocator,
             .warnings = std.array_list.Managed([]u8).init(allocator),
             .installed_packages = std.array_list.Managed([]u8).init(allocator),
+            .probe_notes = std.array_list.Managed([]u8).init(allocator),
         };
     }
 
@@ -122,6 +125,8 @@ const AppState = struct {
         self.warnings.deinit();
         for (self.installed_packages.items) |pkg| self.allocator.free(pkg);
         self.installed_packages.deinit();
+        for (self.probe_notes.items) |note| self.allocator.free(note);
+        self.probe_notes.deinit();
     }
 };
 
@@ -215,13 +220,14 @@ fn stepName(step: Step) []const u8 {
         .drivers => "drivers",
         .xdm => "xdm",
         .vtwm => "vtwm",
+        .probe => "probe",
         .validate => "validate",
         .done => "done",
     };
 }
 
 fn stepFromName(name: []const u8) Step {
-    inline for ([_]Step{ .none, .preflight, .detect, .sysctl, .packages, .drivers, .xdm, .vtwm, .validate, .done }) |s| {
+    inline for ([_]Step{ .none, .preflight, .detect, .sysctl, .packages, .drivers, .xdm, .vtwm, .probe, .validate, .done }) |s| {
         if (std.mem.eql(u8, name, stepName(s))) return s;
     }
     return .none;
@@ -254,7 +260,8 @@ fn nextStepAfter(step: Step) Step {
         .packages => .drivers,
         .drivers => .xdm,
         .xdm => .vtwm,
-        .vtwm => .validate,
+        .vtwm => .probe,
+        .probe => .validate,
         .validate => .done,
         .done => .done,
     };
@@ -340,6 +347,11 @@ fn appendWarning(app: *AppState, comptime fmt: []const u8, args: anytype) !void 
     try writeLog(app, .validate, msg);
 }
 
+fn appendProbeNote(app: *AppState, comptime fmt: []const u8, args: anytype) !void {
+    const msg = try std.fmt.allocPrint(app.allocator, fmt, args);
+    try app.probe_notes.append(msg);
+    try writeLog(app, .probe, msg);
+}
 
 fn appendInstalledPackage(app: *AppState, pkg: []const u8) !void {
     for (app.installed_packages.items) |existing| {
@@ -485,7 +497,7 @@ fn buildDesktopRcBody(app: *AppState) ![]u8 {
     defer app.allocator.free(kld_line);
 
     return try std.fmt.allocPrint(app.allocator,
-        "xdm_enable=\"NO\"\ndbus_enable=\"YES\"\nhald_enable=\"YES\"\nmixer_enable=\"YES\"\n{s}{s}{s}",
+        "xdm_enable=\"YES\"\ndbus_enable=\"YES\"\nhald_enable=\"YES\"\nmixer_enable=\"YES\"\n{s}{s}{s}",
         .{ webcamd_line, powerd_flags, kld_line },
     );
 }
@@ -511,33 +523,7 @@ fn startServiceIfPresent(app: *AppState, step: Step, name: []const u8) !void {
     try runBestEffort(app, step, "starting desktop service", cmd);
 }
 
-fn highestConfiguredVt(app: *AppState) !u32 {
-    if (!fileExists(TTYS_PATH)) return 8;
-    const content = try readFileAlloc(app.allocator, TTYS_PATH, 1024 * 1024);
-    defer app.allocator.free(content);
-
-    var max_vt: u32 = 0;
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |line| {
-        const trimmed_left = std.mem.trimLeft(u8, line, " \t");
-        if (!std.mem.startsWith(u8, trimmed_left, "ttyv")) continue;
-        var idx: usize = 4;
-        while (idx < trimmed_left.len and std.ascii.isDigit(trimmed_left[idx])) : (idx += 1) {}
-        if (idx == 4) continue;
-        const n = std.fmt.parseInt(u32, trimmed_left[4..idx], 10) catch continue;
-        if (n > max_vt) max_vt = n;
-    }
-    if (max_vt == 0) return 8;
-    return max_vt;
-}
-
-fn ensureLastVtXdmEnabled(app: *AppState, step: Step) !void {
-    const vt_num = try highestConfiguredVt(app);
-    const target = try std.fmt.allocPrint(app.allocator, "ttyv{d}", .{vt_num});
-    defer app.allocator.free(target);
-    const desired = try std.fmt.allocPrint(app.allocator, "{s}   \"/usr/local/bin/xdm -nodaemon\"  xterm   on  secure", .{target});
-    defer app.allocator.free(desired);
-
+fn ensureAllTtysXdmDisabled(app: *AppState, step: Step) !void {
     var existing_opt: ?[]u8 = null;
     if (fileExists(TTYS_PATH)) {
         existing_opt = try readFileAlloc(app.allocator, TTYS_PATH, 1024 * 1024);
@@ -548,18 +534,22 @@ fn ensureLastVtXdmEnabled(app: *AppState, step: Step) !void {
     var out = std.array_list.Managed(u8).init(app.allocator);
     defer out.deinit();
 
-    var found = false;
-    var lines = std.mem.splitScalar(u8, existing, '\n');
+    var lines = std.mem.splitScalar(u8, existing, '
+');
     while (lines.next()) |line| {
-        const trimmed_left = std.mem.trimLeft(u8, line, " \t");
-        if (std.mem.startsWith(u8, trimmed_left, target)) {
-            try out.writer().print("{s}\n", .{desired});
-            found = true;
+        const trimmed_left = std.mem.trimLeft(u8, line, " 	");
+        if (std.mem.startsWith(u8, trimmed_left, "ttyv") and std.mem.indexOf(u8, trimmed_left, "/usr/local/bin/xdm -nodaemon") != null) {
+            var fields = std.mem.tokenizeAny(u8, trimmed_left, " 	");
+            const tty_name = fields.next() orelse "ttyv8";
+            const new_line = try std.fmt.allocPrint(app.allocator, "{s}   \"/usr/local/bin/xdm -nodaemon\"  xterm   off secure", .{tty_name});
+            defer app.allocator.free(new_line);
+            try out.writer().print("{s}
+", .{new_line});
         } else if (line.len > 0) {
-            try out.writer().print("{s}\n", .{line});
+            try out.writer().print("{s}
+", .{line});
         }
     }
-    if (!found) try out.writer().print("{s}\n", .{desired});
 
     const new_content = try out.toOwnedSlice();
     defer app.allocator.free(new_content);
@@ -574,9 +564,10 @@ fn anyTtysXdmEntryEnabled(app: *AppState) !bool {
     const content = try readFileAlloc(app.allocator, TTYS_PATH, 1024 * 1024);
     defer app.allocator.free(content);
 
-    var lines = std.mem.splitScalar(u8, content, '\n');
+    var lines = std.mem.splitScalar(u8, content, '
+');
     while (lines.next()) |line| {
-        const trimmed_left = std.mem.trimLeft(u8, line, " \t");
+        const trimmed_left = std.mem.trimLeft(u8, line, " 	");
         if (trimmed_left.len == 0 or trimmed_left[0] == '#') continue;
         if (std.mem.indexOf(u8, trimmed_left, "/usr/local/bin/xdm -nodaemon") != null and
             std.mem.indexOf(u8, trimmed_left, " off ") == null)
@@ -1371,12 +1362,12 @@ fn stepDrivers(app: *AppState) !void {
 fn stepXdm(app: *AppState) !void {
     const step: Step = .xdm;
 
-    const disable_rc = try runCommand(app, step, "disabling rc.conf XDM startup in favor of tty startup", "sysrc xdm_enable=NO");
-    defer app.allocator.free(disable_rc.out);
-    if (disable_rc.code != 0) return error.XdmEnableFailed;
+    const enable_rc = try runCommand(app, step, "enabling XDM in rc.conf", "sysrc xdm_enable=YES");
+    defer app.allocator.free(enable_rc.out);
+    if (enable_rc.code != 0) return error.XdmEnableFailed;
 
     try ensureDir("/usr/local/etc/X11/xdm");
-    try ensureLastVtXdmEnabled(app, step);
+    try ensureAllTtysXdmDisabled(app, step);
 
     const xservers_body =
         \\# BEGIN TKVNBSD
@@ -1409,8 +1400,7 @@ fn stepXdm(app: *AppState) !void {
     _ = try writeFileIfDifferent(app, step, XDM_XSESSION, xsession_body);
     try ensureExecutable(app, step, XDM_XSESSION);
 
-    const vt_num = try highestConfiguredVt(app);
-    try appendWarning(app, "xdm is configured for zero-interaction boot on the highest configured virtual terminal ttyv{d}; rc.conf xdm startup was disabled to avoid conflicting startup methods", .{vt_num});
+    try appendWarning(app, "xdm is configured through rc.conf xdm_enable=YES with managed Xservers/Xsession; tty-based xdm startup entries were forced off to avoid conflicting startup methods", .{});
 
     app.last_completed = .xdm;
     try saveState(app, .xdm);
@@ -1488,6 +1478,84 @@ fn stepVtwm(app: *AppState) !void {
     try saveState(app, .vtwm);
 }
 
+
+fn probeCommandContains(app: *AppState, label: []const u8, command: []const u8, needle: ?[]const u8) !bool {
+    const res = try runCommand(app, .probe, label, command);
+    defer app.allocator.free(res.out);
+    if (res.code != 0) {
+        try appendProbeNote(app, "[fail] {s}: command failed", .{label});
+        return false;
+    }
+    if (needle) |n| {
+        if (std.mem.indexOf(u8, res.out, n) == null) {
+            try appendProbeNote(app, "[fail] {s}: expected content not found", .{label});
+            return false;
+        }
+    }
+    try appendProbeNote(app, "[ok] {s}", .{label});
+    return true;
+}
+
+fn probeFileExists(app: *AppState, label: []const u8, path: []const u8) !bool {
+    if (!fileExists(path)) {
+        try appendProbeNote(app, "[fail] {s}: missing {s}", .{ label, path });
+        return false;
+    }
+    try appendProbeNote(app, "[ok] {s}: {s}", .{ label, path });
+    return true;
+}
+
+fn probeFileContains(app: *AppState, label: []const u8, path: []const u8, needle: []const u8) !bool {
+    if (!(try fileContains(path, needle, app.allocator))) {
+        try appendProbeNote(app, "[fail] {s}: expected content not found in {s}", .{ label, path });
+        return false;
+    }
+    try appendProbeNote(app, "[ok] {s}", .{label});
+    return true;
+}
+
+fn stepProbe(app: *AppState) !void {
+    const step: Step = .probe;
+    app.probe_notes.clearRetainingCapacity();
+    setAction(app, step, "simulating and validating xdm + vtwm startup path");
+
+    _ = try probeCommandContains(app, "rc.conf enables xdm", "sysrc -n xdm_enable", "YES");
+    _ = try probeFileExists(app, "xdm binary present", "/usr/local/bin/xdm");
+    _ = try probeFileExists(app, "X server binary present", "/usr/local/bin/X");
+    _ = try probeFileExists(app, "vtwm binary present", "/usr/local/bin/vtwm");
+    _ = try probeFileExists(app, "XDM Xservers present", XDM_XSERVERS);
+    _ = try probeFileExists(app, "XDM Xsession present", XDM_XSESSION);
+    _ = try probeFileContains(app, "XDM Xservers local display entry", XDM_XSERVERS, ":0 local /usr/local/bin/X -nolisten tcp");
+    _ = try probeFileContains(app, "XDM Xsession launches vtwm", XDM_XSESSION, "/usr/local/bin/vtwm");
+
+    const user_xsession = try std.fmt.allocPrint(app.allocator, "{s}/.xsession", .{app.home_dir.?});
+    defer app.allocator.free(user_xsession);
+    const user_xinitrc = try std.fmt.allocPrint(app.allocator, "{s}/.xinitrc", .{app.home_dir.?});
+    defer app.allocator.free(user_xinitrc);
+
+    _ = try probeFileExists(app, "user .xsession present", user_xsession);
+    _ = try probeFileExists(app, "user .xinitrc present", user_xinitrc);
+    _ = try probeFileContains(app, "user .xsession launches vtwm", user_xsession, "/usr/local/bin/vtwm");
+    _ = try probeFileContains(app, "user .xinitrc launches vtwm", user_xinitrc, "/usr/local/bin/vtwm");
+
+    if (try anyTtysXdmEntryEnabled(app)) {
+        try appendProbeNote(app, "[warn] tty-based xdm startup is still enabled in /etc/ttys and may conflict with rc.conf startup", .{});
+    } else {
+        try appendProbeNote(app, "[ok] tty-based xdm startup is disabled, avoiding conflict with rc.conf startup", .{});
+    }
+
+    if (try groupHasUser(app, "video")) {
+        try appendProbeNote(app, "[ok] target user is in video group", .{});
+    } else {
+        try appendProbeNote(app, "[fail] target user is not in video group", .{});
+    }
+
+    try appendProbeNote(app, "[info] simulation is a static startup-path validation of binaries, config files, startup model, and session handoff; it does not launch a live X server from inside the installer", .{});
+
+    app.last_completed = .probe;
+    try saveState(app, .probe);
+}
+
 fn requirePkg(app: *AppState, vr: *ValidationResult, pkg: []const u8) !void {
     if (!(try pkgInstalled(app, pkg))) {
         vr.ok = false;
@@ -1507,25 +1575,15 @@ fn stepValidate(app: *AppState) !ValidationResult {
     {
         const res = try runCommand(app, step, "checking xdm_enable", "sysrc -n xdm_enable");
         defer app.allocator.free(res.out);
-        if (!std.mem.eql(u8, trimAscii(res.out), "NO")) {
-            vr.warnings += 1;
-            try appendWarning(app, "xdm_enable is not NO in rc.conf; tty-based startup may conflict with rc-based startup", .{});
-        }
-    }
-    {
-        const vt_num = try highestConfiguredVt(app);
-        const expected_tty = try std.fmt.allocPrint(app.allocator, "ttyv{d}   \"/usr/local/bin/xdm -nodaemon\"  xterm   on  secure", .{vt_num});
-        defer app.allocator.free(expected_tty);
-        if (!(try fileContains(TTYS_PATH, expected_tty, app.allocator))) {
+        if (!std.mem.eql(u8, trimAscii(res.out), "YES")) {
             vr.ok = false;
             vr.warnings += 1;
-            try appendWarning(app, "highest configured virtual terminal is not wired to start xdm automatically", .{});
+            try appendWarning(app, "xdm_enable is not YES in rc.conf", .{});
         }
     }
-    if (!(try anyTtysXdmEntryEnabled(app))) {
-        vr.ok = false;
+    if (try anyTtysXdmEntryEnabled(app)) {
         vr.warnings += 1;
-        try appendWarning(app, "no enabled xdm tty entry was found in /etc/ttys", .{});
+        try appendWarning(app, "tty-based xdm entry is still enabled; rc.conf startup may conflict with tty-based startup", .{});
     }
 
     const xsession_path = try std.fmt.allocPrint(app.allocator, "{s}/.xsession", .{app.home_dir.?});
@@ -1664,6 +1722,7 @@ fn runStepWithRetry(app: *AppState, step: Step) !void {
             .drivers => stepDrivers(app),
             .xdm => stepXdm(app),
             .vtwm => stepVtwm(app),
+            .probe => stepProbe(app),
             else => return,
         };
 
@@ -1687,11 +1746,23 @@ fn resultScreen(app: *AppState, vr: ValidationResult) void {
     uiPrintf(4, 4, "Warnings: {d}", .{app.warnings.items.len});
     uiPrintf(5, 4, "Packages installed successfully this run: {d}", .{app.installed_packages.items.len});
     uiPrintf(6, 4, "Package checksum verification: {s}", .{if (app.checksum_enabled) "enabled" else "disabled"});
-    uiPrint(8, 4, "Stages completed: preflight, detect, sysctl, packages, drivers, xdm, vtwm, validate");
-    uiPrint(9, 4, "Desktop post-config applied: sysctl profile, powerd, desktop groups, Xorg input/layout, graphics modules, highest-VT XDM autostart, managed Xservers/Xsession, vtwm user session.");
-    uiPrint(10, 4, "Installed packages:");
+    uiPrint(8, 4, "Stages completed: preflight, detect, sysctl, packages, drivers, xdm, vtwm, probe, validate");
+    uiPrint(9, 4, "Desktop post-config applied: sysctl profile, powerd, desktop groups, Xorg input/layout, graphics modules, rc.conf XDM enablement, managed Xservers/Xsession, vtwm user session.");
+    uiPrint(10, 4, "Validation / simulation checks:");
+    var row: i32 = 11;
+    if (app.probe_notes.items.len == 0) {
+        uiPrint(row, 6, "No probe notes recorded.");
+        row += 1;
+    } else {
+        for (app.probe_notes.items[0..@min(app.probe_notes.items.len, @as(usize, 6))]) |note| {
+            uiPrintf(row, 6, "{s}", .{note});
+            row += 1;
+        }
+    }
 
-    const start_row: i32 = 11;
+    uiPrint(row, 4, "Installed packages:");
+    row += 1;
+    const start_row: i32 = row;
     const end_row: i32 = c.LINES - 6;
     const usable_rows: usize = if (end_row > start_row) @intCast(end_row - start_row + 1) else 1;
     const col_width: i32 = @divTrunc(c.COLS - 8, 3);
@@ -1700,15 +1771,15 @@ fn resultScreen(app: *AppState, vr: ValidationResult) void {
         uiPrint(start_row, 6, "No new packages were installed in this run.");
     } else {
         for (app.installed_packages.items, 0..) |pkg, idx| {
-            const row: i32 = start_row + @as(i32, @intCast(idx % usable_rows));
+            const pkg_row: i32 = start_row + @as(i32, @intCast(idx % usable_rows));
             const col_idx: i32 = @as(i32, @intCast(idx / usable_rows));
             if (col_idx >= 3) break;
             const col: i32 = 6 + col_idx * col_width;
-            uiPrintf(row, col, "- {s}", .{pkg});
+            uiPrintf(pkg_row, col, "- {s}", .{pkg});
         }
     }
 
-    uiPrint(c.LINES - 4, 4, "Failed packages are not listed here. Check the log file for failures. Press q to exit.");
+    uiPrint(c.LINES - 4, 4, "The simulation step validates startup model, binaries, config files, and vtwm handoff without launching a live X server. Press q to exit.");
     _ = c.refresh();
     while (true) {
         const ch = c.getch();
@@ -1755,7 +1826,7 @@ pub fn main() !void {
     if (!screenDetection(&app)) return;
     if (!screenSummary(&app, resume_from)) return;
 
-    const ordered_steps = [_]Step{ .sysctl, .packages, .drivers, .xdm, .vtwm };
+    const ordered_steps = [_]Step{ .sysctl, .packages, .drivers, .xdm, .vtwm, .probe };
     var should_run = resume_from == .sysctl;
     for (ordered_steps) |s| {
         if (s == resume_from) should_run = true;
