@@ -469,7 +469,7 @@ fn runCapture(allocator: Allocator, command: []const u8) !CmdResult {
 
     const status = c.pclose(fp);
     var code: i32 = status;
-    if (c.WIFEXITED(status) != 0) code = c.WEXITSTATUS(status);
+    if (status >= 0) code = @as(i32, @intCast((@as(u32, @bitCast(status)) >> 8) & 0xff));
     return .{ .code = code, .out = try out.toOwnedSlice() };
 }
 
