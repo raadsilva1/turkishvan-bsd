@@ -1068,14 +1068,16 @@ fn retryOrQuit(app: *AppState, failed_step: Step, err_name: []const u8) bool {
 
 fn runStepWithRetry(app: *AppState, step: Step) !void {
     while (true) {
-        switch (step) {
+        const step_result = switch (step) {
             .sysctl => stepSysctl(app),
             .packages => stepPackages(app),
             .drivers => stepDrivers(app),
             .xdm => stepXdm(app),
             .vtwm => stepVtwm(app),
             else => return,
-        } catch |err| {
+        };
+
+        step_result catch |err| {
             const name = @errorName(err);
             const msg = try std.fmt.allocPrint(app.allocator, "step {s} error: {s}", .{ stepName(step), name });
             defer app.allocator.free(msg);
@@ -1083,6 +1085,7 @@ fn runStepWithRetry(app: *AppState, step: Step) !void {
             if (!retryOrQuit(app, step, name)) return err;
             continue;
         };
+
         return;
     }
 }
