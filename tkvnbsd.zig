@@ -34,6 +34,26 @@ const GpuVendor = enum {
     unknown,
 };
 
+const GpuRole = enum {
+    integrated,
+    dedicated,
+    virtual,
+    unknown,
+};
+
+const GpuStrategy = enum {
+    intel_modesetting,
+    intel_scfb,
+    amd_amdgpu,
+    amd_radeonkms,
+    nvidia,
+    vmware,
+    vboxvideo,
+    scfb,
+    vesa,
+    none,
+};
+
 const MachineKind = enum {
     desktop,
     laptop,
@@ -66,6 +86,25 @@ const CmdResult = struct {
 
 const HardwareInfo = struct {
     gpu: GpuVendor = .unknown,
+    gpu_role: GpuRole = .unknown,
+    gpu_strategy: GpuStrategy = .none,
+    gpu_count: u8 = 0,
+    gpu_hybrid: bool = false,
+    gpu_cpu_related: bool = false,
+    gpu_secondary: GpuVendor = .unknown,
+    gpu_secondary_role: GpuRole = .unknown,
+    boot_method_uefi: bool = true,
+    xorg_prior_crash: bool = false,
+    gpu_model: [160]u8 = [_]u8{0} ** 160,
+    gpu_model_len: usize = 0,
+    gpu_bus: [32]u8 = [_]u8{0} ** 32,
+    gpu_bus_len: usize = 0,
+    gpu_secondary_model: [160]u8 = [_]u8{0} ** 160,
+    gpu_secondary_model_len: usize = 0,
+    gpu_secondary_bus: [32]u8 = [_]u8{0} ** 32,
+    gpu_secondary_bus_len: usize = 0,
+    gpu_reason: [192]u8 = [_]u8{0} ** 192,
+    gpu_reason_len: usize = 0,
     audio_present: bool = false,
     machine: MachineKind = .desktop,
     low_memory: bool = false,
@@ -75,6 +114,16 @@ const HardwareInfo = struct {
         if (self.machine == .vm or self.low_memory) return "safe";
         return "desktop";
     }
+};
+
+const DetectedGpu = struct {
+    vendor: GpuVendor = .unknown,
+    role: GpuRole = .unknown,
+    cpu_related: bool = false,
+    model: [160]u8 = [_]u8{0} ** 160,
+    model_len: usize = 0,
+    bus: [32]u8 = [_]u8{0} ** 32,
+    bus_len: usize = 0,
 };
 
 const ValidationResult = struct {
@@ -172,6 +221,18 @@ const pkgs_video_generic = [_][]const u8{
     "xf86-video-vesa",
 };
 
+const pkgs_video_scfb = [_][]const u8{
+    "xf86-video-scfb",
+};
+
+const pkgs_video_vmware = [_][]const u8{
+    "xf86-video-vmware",
+};
+
+const pkgs_video_vbox = [_][]const u8{
+    "virtualbox-ose-additions",
+};
+
 const pkgs_utils = [_][]const u8{
     "nano",
     "vim-console",
@@ -249,6 +310,263 @@ fn machineName(kind: MachineKind) []const u8 {
         .laptop => "laptop",
         .vm => "vm",
     };
+}
+
+fn gpuRoleName(role: GpuRole) []const u8 {
+    return switch (role) {
+        .integrated => "integrated",
+        .dedicated => "dedicated",
+        .virtual => "virtual",
+        .unknown => "unknown",
+    };
+}
+
+fn gpuStrategyName(strategy: GpuStrategy) []const u8 {
+    return switch (strategy) {
+        .intel_modesetting => "modesetting + i915kms",
+        .intel_scfb => "safe scfb fallback",
+        .amd_amdgpu => "amdgpu",
+        .amd_radeonkms => "radeon legacy KMS",
+        .nvidia => "nvidia proprietary",
+        .vmware => "vmware",
+        .vboxvideo => "virtualbox",
+        .scfb => "scfb",
+        .vesa => "vesa",
+        .none => "none",
+    };
+}
+
+fn fixedSlice(buf: []const u8, len: usize) []const u8 {
+    return buf[0..@min(buf.len, len)];
+}
+
+fn setFixed(buf: []u8, len_ptr: *usize, src: []const u8) void {
+    const n = @min(buf.len, src.len);
+    if (n > 0) std.mem.copyForwards(u8, buf[0..n], src[0..n]);
+    len_ptr.* = n;
+    if (n < buf.len) buf[n] = 0;
+}
+
+fn hwPrimaryModel(hw: HardwareInfo) []const u8 {
+    return fixedSlice(hw.gpu_model[0..], hw.gpu_model_len);
+}
+
+fn hwPrimaryBus(hw: HardwareInfo) []const u8 {
+    return fixedSlice(hw.gpu_bus[0..], hw.gpu_bus_len);
+}
+
+fn hwSecondaryModel(hw: HardwareInfo) []const u8 {
+    return fixedSlice(hw.gpu_secondary_model[0..], hw.gpu_secondary_model_len);
+}
+
+fn hwSecondaryBus(hw: HardwareInfo) []const u8 {
+    return fixedSlice(hw.gpu_secondary_bus[0..], hw.gpu_secondary_bus_len);
+}
+
+fn hwGpuReason(hw: HardwareInfo) []const u8 {
+    return fixedSlice(hw.gpu_reason[0..], hw.gpu_reason_len);
+}
+
+fn asciiLowerOwned(allocator: Allocator, src: []const u8) ![]u8 {
+    var out = try allocator.dupe(u8, src);
+    for (out) |*ch| ch.* = std.ascii.toLower(ch.*);
+    return out;
+}
+
+fn extractQuotedValue(line: []const u8) []const u8 {
+    const first = std.mem.indexOfScalar(u8, line, '\'') orelse return "";
+    const rest = line[first + 1 ..];
+    const second_rel = std.mem.indexOfScalar(u8, rest, '\'') orelse return "";
+    return rest[0..second_rel];
+}
+
+fn parseBusFromHeader(line: []const u8) []const u8 {
+    const at = std.mem.indexOfScalar(u8, line, '@') orelse return "";
+    const after = line[at + 1 ..];
+    var end: usize = 0;
+    while (end < after.len and !std.ascii.isWhitespace(after[end])) : (end += 1) {}
+    if (end == 0) return "";
+    var bus = after[0..end];
+    while (bus.len > 0 and bus[bus.len - 1] == ':') bus = bus[0 .. bus.len - 1];
+    return bus;
+}
+
+fn gpuVendorFromStrings(vendor_text: []const u8, device_text: []const u8, header: []const u8) GpuVendor {
+    const joined = std.fmt.allocPrint(std.heap.page_allocator, "{s} {s} {s}", .{ vendor_text, device_text, header }) catch return .unknown;
+    defer std.heap.page_allocator.free(joined);
+    return detectGpuFromText(joined);
+}
+
+fn amdLooksIntegrated(model: []const u8) bool {
+    const lower = asciiLowerOwned(std.heap.page_allocator, model) catch return false;
+    defer std.heap.page_allocator.free(lower);
+    return std.mem.indexOf(u8, lower, "apu") != null or
+        std.mem.indexOf(u8, lower, "radeon graphics") != null or
+        std.mem.indexOf(u8, lower, "vega 8") != null or
+        std.mem.indexOf(u8, lower, "vega 7") != null or
+        std.mem.indexOf(u8, lower, "680m") != null or
+        std.mem.indexOf(u8, lower, "780m") != null or
+        std.mem.indexOf(u8, lower, "mendocino") != null or
+        std.mem.indexOf(u8, lower, "renoir") != null or
+        std.mem.indexOf(u8, lower, "cezanne") != null or
+        std.mem.indexOf(u8, lower, "rembrandt") != null or
+        std.mem.indexOf(u8, lower, "phoenix") != null;
+}
+
+fn amdNeedsLegacyKms(model: []const u8) bool {
+    const lower = asciiLowerOwned(std.heap.page_allocator, model) catch return false;
+    defer std.heap.page_allocator.free(lower);
+    const old_tokens = [_][]const u8{
+        "cedar", "redwood", "juniper", "cypress", "hemlock", "caicos", "turks", "barts", "cayman", "trinity", "richland", "kabini", "mullins", "oland", "cape verde", "pitcairn",
+    };
+    inline for (old_tokens) |tok| {
+        if (std.mem.indexOf(u8, lower, tok) != null) return true;
+    }
+    if (std.mem.indexOf(u8, lower, "hd ")) |idx| {
+        const tail = lower[idx + 3 ..];
+        var end: usize = 0;
+        while (end < tail.len and std.ascii.isDigit(tail[end])) : (end += 1) {}
+        if (end >= 4) {
+            const num = std.fmt.parseInt(u32, tail[0..end], 10) catch 0;
+            if (num > 0 and num < 7000) return true;
+        }
+    }
+    return false;
+}
+
+fn inferGpuRole(vendor: GpuVendor, model: []const u8) GpuRole {
+    return switch (vendor) {
+        .intel => .integrated,
+        .nvidia => .dedicated,
+        .vm => .virtual,
+        .amd => if (amdLooksIntegrated(model)) .integrated else .dedicated,
+        .unknown => .unknown,
+    };
+}
+
+fn isProcessorRelated(vendor: GpuVendor, role: GpuRole) bool {
+    return vendor == .intel or (vendor == .amd and role == .integrated);
+}
+
+fn gpuPriority(gpu: DetectedGpu) u32 {
+    const role_score: u32 = switch (gpu.role) {
+        .integrated => 400,
+        .dedicated => 300,
+        .virtual => 200,
+        .unknown => 100,
+    };
+    const vendor_score: u32 = switch (gpu.vendor) {
+        .intel => 50,
+        .amd => 40,
+        .nvidia => 30,
+        .vm => 20,
+        .unknown => 0,
+    };
+    return role_score + vendor_score;
+}
+
+fn parseGpuBlock(block: []const u8) ?DetectedGpu {
+    var header: []const u8 = "";
+    var vendor_line: []const u8 = "";
+    var device_line: []const u8 = "";
+
+    var lines = std.mem.splitScalar(u8, block, '\n');
+    while (lines.next()) |line| {
+        const t = trimAscii(line);
+        if (t.len == 0) continue;
+        if (std.mem.indexOf(u8, t, "@pci") != null and header.len == 0) header = t;
+        if (std.mem.startsWith(u8, t, "vendor")) vendor_line = extractQuotedValue(t);
+        if (std.mem.startsWith(u8, t, "device")) device_line = extractQuotedValue(t);
+    }
+
+    const vendor = gpuVendorFromStrings(vendor_line, device_line, header);
+    if (vendor == .unknown and device_line.len == 0 and header.len == 0) return null;
+
+    var gpu = DetectedGpu{};
+    gpu.vendor = vendor;
+    const model = if (device_line.len > 0) device_line else vendor_line;
+    setFixed(gpu.model[0..], &gpu.model_len, model);
+    const bus = parseBusFromHeader(header);
+    setFixed(gpu.bus[0..], &gpu.bus_len, bus);
+    gpu.role = inferGpuRole(vendor, model);
+    gpu.cpu_related = isProcessorRelated(vendor, gpu.role);
+    return gpu;
+}
+
+fn primaryGpuIndex(gpus: []const DetectedGpu) usize {
+    var best_idx: usize = 0;
+    var best_score: u32 = 0;
+    for (gpus, 0..) |gpu, idx| {
+        const score = gpuPriority(gpu);
+        if (idx == 0 or score > best_score) {
+            best_idx = idx;
+            best_score = score;
+        }
+    }
+    return best_idx;
+}
+
+fn xorgLogShowsModesettingCrash(app: *AppState) !bool {
+    const paths = [_][]const u8{ "/var/log/Xorg.0.log", "/var/log/Xorg.0.log.old" };
+    for (paths) |path| {
+        if (!fileExists(path)) continue;
+        const content = try readFileAlloc(app.allocator, path, 1024 * 1024);
+        defer app.allocator.free(content);
+        if (std.mem.indexOf(u8, content, "modesetting") != null and
+            std.mem.indexOf(u8, content, "Segmentation Fault") != null)
+            return true;
+    }
+    return false;
+}
+
+fn evaluateGpuStrategy(hw: *HardwareInfo) void {
+    if (hw.gpu == .intel) {
+        if (hw.xorg_prior_crash) {
+            hw.gpu_strategy = if (hw.boot_method_uefi) .intel_scfb else .vesa;
+            setFixed(hw.gpu_reason[0..], &hw.gpu_reason_len, "previous Xorg modesetting crash detected; selecting safe fallback for Intel");
+        } else {
+            hw.gpu_strategy = .intel_modesetting;
+            setFixed(hw.gpu_reason[0..], &hw.gpu_reason_len, if (hw.gpu_hybrid) "hybrid graphics detected; preferring integrated Intel GPU for stable XDM/Xorg startup" else "single Intel GPU detected; preferring modern KMS + modesetting path");
+        }
+        return;
+    }
+    if (hw.gpu == .amd) {
+        if (amdNeedsLegacyKms(hwPrimaryModel(hw.*))) {
+            hw.gpu_strategy = .amd_radeonkms;
+            setFixed(hw.gpu_reason[0..], &hw.gpu_reason_len, "older AMD generation detected; selecting legacy radeonkms path");
+        } else {
+            hw.gpu_strategy = .amd_amdgpu;
+            setFixed(hw.gpu_reason[0..], &hw.gpu_reason_len, "modern AMD generation detected; selecting amdgpu path");
+        }
+        return;
+    }
+    if (hw.gpu == .nvidia) {
+        hw.gpu_strategy = .nvidia;
+        setFixed(hw.gpu_reason[0..], &hw.gpu_reason_len, "NVIDIA GPU selected as primary display processor");
+        return;
+    }
+    if (hw.gpu == .vm) {
+        const model = hwPrimaryModel(hw.*);
+        const lower = asciiLowerOwned(std.heap.page_allocator, model) catch {
+            hw.gpu_strategy = if (hw.boot_method_uefi) .scfb else .vesa;
+            setFixed(hw.gpu_reason[0..], &hw.gpu_reason_len, "virtual graphics detected; generic fallback chosen");
+            return;
+        };
+        defer std.heap.page_allocator.free(lower);
+        if (std.mem.indexOf(u8, lower, "vmware") != null) {
+            hw.gpu_strategy = .vmware;
+            setFixed(hw.gpu_reason[0..], &hw.gpu_reason_len, "VMware virtual GPU detected");
+        } else if (std.mem.indexOf(u8, lower, "virtualbox") != null or std.mem.indexOf(u8, lower, "vbox") != null) {
+            hw.gpu_strategy = .vboxvideo;
+            setFixed(hw.gpu_reason[0..], &hw.gpu_reason_len, "VirtualBox virtual GPU detected");
+        } else {
+            hw.gpu_strategy = if (hw.boot_method_uefi) .scfb else .vesa;
+            setFixed(hw.gpu_reason[0..], &hw.gpu_reason_len, "generic virtual GPU detected; choosing framebuffer fallback");
+        }
+        return;
+    }
+    hw.gpu_strategy = if (hw.boot_method_uefi) .scfb else .vesa;
+    setFixed(hw.gpu_reason[0..], &hw.gpu_reason_len, if (hw.boot_method_uefi) "unknown GPU under UEFI; choosing SCFB fallback per FreeBSD guidance" else "unknown GPU under BIOS; choosing VESA fallback per FreeBSD guidance");
 }
 
 fn nextStepAfter(step: Step) Step {
@@ -489,7 +807,7 @@ fn buildDesktopRcBody(app: *AppState) ![]u8 {
         "powerd_enable=\"YES\"\npowerd_flags=\"-a hiadaptive -b adaptive -i 25 -r 85 -N\"\n"
     else
         "powerd_enable=\"YES\"\npowerd_flags=\"-a hiadaptive -n hiadaptive -i 25 -r 85 -N\"\n";
-    const kld_line = if (driverModuleName(app.hw.gpu)) |modname|
+    const kld_line = if (driverModuleName(app.hw)) |modname|
         try std.fmt.allocPrint(app.allocator, "kld_list=\"${{kld_list}} {s}\"\n", .{modname})
     else
         try app.allocator.dupe(u8, "");
@@ -502,13 +820,8 @@ fn buildDesktopRcBody(app: *AppState) ![]u8 {
     );
 }
 
-fn driverModuleName(gpu: GpuVendor) ?[]const u8 {
-    return switch (gpu) {
-        .intel => "i915kms",
-        .amd => "amdgpu",
-        .nvidia => "nvidia",
-        .vm, .unknown => null,
-    };
+fn driverModuleName(hw: HardwareInfo) ?[]const u8 {
+    return selectedKernelModule(hw);
 }
 
 fn startServiceIfPresent(app: *AppState, step: Step, name: []const u8) !void {
@@ -978,13 +1291,17 @@ fn boolPrompt(title: []const u8, question: []const u8) bool {
 
 fn screenDetection(app: *AppState) bool {
     drawFrame("tkvnbsd - detection");
-    uiPrintf(4, 4, "Detected GPU: {s}", .{gpuName(app.hw.gpu)});
-    uiPrintf(5, 4, "Audio present: {s}", .{if (app.hw.audio_present) "yes" else "no"});
-    uiPrintf(6, 4, "Machine guess: {s}", .{machineName(app.hw.machine)});
-    uiPrintf(7, 4, "Low memory: {s}", .{if (app.hw.low_memory) "yes" else "no"});
-    uiPrintf(8, 4, "RAM bytes: {d}", .{app.hw.physmem_bytes});
-    uiPrint(9, 4, "Selected stack: X11 + XDM + vtwm");
-    uiPrintf(10, 4, "Sysctl profile: {s}", .{app.hw.profile()});
+    uiPrintf(4, 4, "Primary GPU: {s} :: {s}", .{ gpuName(app.hw.gpu), if (hwPrimaryModel(app.hw).len > 0) hwPrimaryModel(app.hw) else "<unknown model>" });
+    uiPrintf(5, 4, "Primary bus: {s}   role: {s}   processor-related: {s}", .{ if (hwPrimaryBus(app.hw).len > 0) hwPrimaryBus(app.hw) else "<unknown>", gpuRoleName(app.hw.gpu_role), if (app.hw.gpu_cpu_related) "yes" else "no" });
+    uiPrintf(6, 4, "Secondary GPU: {s}", .{if (app.hw.gpu_secondary != .unknown) hwSecondaryModel(app.hw) else "none"});
+    uiPrintf(7, 4, "Hybrid graphics: {s}   boot: {s}", .{ if (app.hw.gpu_hybrid) "yes" else "no", if (app.hw.boot_method_uefi) "UEFI" else "BIOS/legacy" });
+    uiPrintf(8, 4, "Selected graphics strategy: {s}", .{gpuStrategyName(app.hw.gpu_strategy)});
+    uiPrintf(9, 4, "Reason: {s}", .{if (hwGpuReason(app.hw).len > 0) hwGpuReason(app.hw) else "n/a"});
+    uiPrintf(10, 4, "Audio present: {s}   machine: {s}", .{if (app.hw.audio_present) "yes" else "no", machineName(app.hw.machine)});
+    uiPrintf(11, 4, "Low memory: {s}   RAM bytes: {d}", .{if (app.hw.low_memory) "yes" else "no", app.hw.physmem_bytes});
+    uiPrintf(12, 4, "Prior Xorg crash marker: {s}", .{if (app.hw.xorg_prior_crash) "yes" else "no"});
+    uiPrint(13, 4, "Selected stack: X11 + XDM + vtwm");
+    uiPrintf(14, 4, "Sysctl profile: {s}", .{app.hw.profile()});
     while (true) {
         const ch = c.getch();
         switch (ch) {
@@ -1008,10 +1325,11 @@ fn screenSummary(app: *AppState, resume_from: Step) bool {
     uiPrint(9, 4, "The tool will:");
     uiPrint(10, 6, "- apply managed sysctl desktop tuning");
     uiPrint(11, 6, "- install desktop, productivity, and multimedia packages");
-    uiPrint(12, 6, "- configure graphics/audio/input basics");
-    uiPrint(13, 6, "- enable XDM");
-    uiPrint(14, 6, "- create a vtwm session path for the target user when safe");
-    uiPrint(15, 6, if (app.checksum_enabled) "- run package checksum verification" else "- skip package checksum verification");
+    uiPrint(12, 6, "- evaluate all detected display adapters and choose the safest primary GPU path");
+    uiPrint(13, 6, "- configure graphics/audio/input basics");
+    uiPrint(14, 6, "- enable XDM");
+    uiPrint(15, 6, "- create a vtwm session path for the target user when safe");
+    uiPrint(16, 6, if (app.checksum_enabled) "- run package checksum verification" else "- skip package checksum verification");
     while (true) {
         const ch = c.getch();
         switch (ch) {
@@ -1120,14 +1438,56 @@ fn stepPreflight(app: *AppState) !void {
 fn stepDetect(app: *AppState) !void {
     const step: Step = .detect;
     {
-        const res = try runCommand(app, step, "probing GPU", "pciconf -lv | grep -A4 -E '^((vgapci|drmn)[0-9]+@)' || true");
+        const res = try runCommand(app, step, "probing GPU inventory", "pciconf -lv | egrep -B3 -A4 'class=0x03|display' || true");
         defer app.allocator.free(res.out);
-        app.hw.gpu = detectGpuFromText(res.out);
+
+        var gpus: [4]DetectedGpu = undefined;
+        var gpu_count: usize = 0;
+        var blocks = std.mem.splitSequence(u8, res.out, "--\n");
+        while (blocks.next()) |block| {
+            if (gpu_count >= gpus.len) break;
+            if (parseGpuBlock(block)) |gpu| {
+                gpus[gpu_count] = gpu;
+                gpu_count += 1;
+            }
+        }
+
+        app.hw.gpu_count = @as(u8, @intCast(gpu_count));
+        if (gpu_count > 0) {
+            const primary_idx = primaryGpuIndex(gpus[0..gpu_count]);
+            const primary = gpus[primary_idx];
+            app.hw.gpu = primary.vendor;
+            app.hw.gpu_role = primary.role;
+            app.hw.gpu_cpu_related = primary.cpu_related;
+            setFixed(app.hw.gpu_model[0..], &app.hw.gpu_model_len, fixedSlice(primary.model[0..], primary.model_len));
+            setFixed(app.hw.gpu_bus[0..], &app.hw.gpu_bus_len, fixedSlice(primary.bus[0..], primary.bus_len));
+
+            if (gpu_count > 1) {
+                var secondary_idx: usize = if (primary_idx == 0) 1 else 0;
+                if (secondary_idx < gpu_count) {
+                    const secondary = gpus[secondary_idx];
+                    app.hw.gpu_secondary = secondary.vendor;
+                    app.hw.gpu_secondary_role = secondary.role;
+                    setFixed(app.hw.gpu_secondary_model[0..], &app.hw.gpu_secondary_model_len, fixedSlice(secondary.model[0..], secondary.model_len));
+                    setFixed(app.hw.gpu_secondary_bus[0..], &app.hw.gpu_secondary_bus_len, fixedSlice(secondary.bus[0..], secondary.bus_len));
+                    app.hw.gpu_hybrid = (primary.role == .integrated and secondary.role == .dedicated) or (primary.vendor != secondary.vendor);
+                }
+            }
+        } else {
+            app.hw.gpu = .unknown;
+            app.hw.gpu_role = .unknown;
+        }
     }
     {
         const res = try runCommand(app, step, "probing audio", "pciconf -lv | egrep -i 'audio|multimedia'");
         defer app.allocator.free(res.out);
         app.hw.audio_present = trimAscii(res.out).len > 0;
+    }
+    {
+        const boot_res = try runCommand(app, step, "checking boot method", "sysctl -n machdep.bootmethod || true");
+        defer app.allocator.free(boot_res.out);
+        const boot = trimAscii(boot_res.out);
+        app.hw.boot_method_uefi = std.mem.indexOf(u8, boot, "UEFI") != null;
     }
     {
         const vm_res = try runCommand(app, step, "checking virtualization", "sysctl -n kern.vm_guest || true");
@@ -1147,6 +1507,8 @@ fn stepDetect(app: *AppState) !void {
         app.hw.physmem_bytes = std.fmt.parseInt(u64, trimAscii(mem_res.out), 10) catch 0;
         app.hw.low_memory = app.hw.physmem_bytes > 0 and app.hw.physmem_bytes < 4 * 1024 * 1024 * 1024;
     }
+    app.hw.xorg_prior_crash = try xorgLogShowsModesettingCrash(app);
+    evaluateGpuStrategy(&app.hw);
     app.last_completed = .detect;
 }
 
@@ -1282,59 +1644,92 @@ fn stepPackages(app: *AppState) !void {
 }
 
 fn videoPkgList(hw: HardwareInfo) []const []const u8 {
-    return switch (hw.gpu) {
-        .intel => pkgs_video_intel[0..],
-        .amd => pkgs_video_amd[0..],
+    return switch (hw.gpu_strategy) {
+        .intel_modesetting, .intel_scfb => if (hw.gpu_strategy == .intel_modesetting) pkgs_video_intel[0..] else pkgs_video_scfb[0..],
+        .amd_amdgpu, .amd_radeonkms => pkgs_video_amd[0..],
         .nvidia => pkgs_video_nvidia[0..],
-        .vm => pkgs_video_vm[0..],
-        .unknown => pkgs_video_generic[0..],
+        .vmware => pkgs_video_vmware[0..],
+        .vboxvideo => pkgs_video_vbox[0..],
+        .scfb => pkgs_video_scfb[0..],
+        .vesa => pkgs_video_generic[0..],
+        .none => pkgs_video_generic[0..],
     };
 }
 
-fn loaderBodyForGpu(gpu: GpuVendor) []const u8 {
-    return switch (gpu) {
-        .intel =>
+fn selectedKernelModule(hw: HardwareInfo) ?[]const u8 {
+    return switch (hw.gpu_strategy) {
+        .intel_modesetting => "i915kms",
+        .intel_scfb => null,
+        .amd_amdgpu => "amdgpu",
+        .amd_radeonkms => "radeonkms",
+        .nvidia => "nvidia-drm",
+        else => null,
+    };
+}
+
+fn loaderBodyForHw(hw: HardwareInfo) []const u8 {
+    return switch (hw.gpu_strategy) {
+        .intel_modesetting =>
         \\# Intel DRM
         \\i915kms_load="YES"
         ,
-        .amd =>
+        .intel_scfb =>
+        \\# Intel safe fallback uses the system framebuffer
+        \\
+        ,
+        .amd_amdgpu =>
         \\# AMD DRM
         \\amdgpu_load="YES"
         ,
+        .amd_radeonkms =>
+        \\# AMD legacy DRM
+        \\radeonkms_load="YES"
+        ,
         .nvidia =>
         \\# NVIDIA kernel modules
-        \\nvidia_load="YES"
+        \\nvidia-drm_load="YES"
+        \\hw.nvidiadrm.modeset="1"
         ,
-        .vm, .unknown =>
+        else =>
         \\# generic loader settings
         \\
         ,
     };
 }
 
+fn selectedXorgDriver(hw: HardwareInfo) ?[]const u8 {
+    return switch (hw.gpu_strategy) {
+        .intel_modesetting => "modesetting",
+        .intel_scfb => "scfb",
+        .amd_amdgpu => "amdgpu",
+        .amd_radeonkms => "radeon",
+        .nvidia => "nvidia",
+        .vmware => "vmware",
+        .vboxvideo => "vboxvideo",
+        .scfb => "scfb",
+        .vesa => "vesa",
+        .none => null,
+    };
+}
 
 fn buildGpuDeviceBody(app: *AppState) ![]u8 {
-    return switch (app.hw.gpu) {
-        .intel => try std.fmt.allocPrint(app.allocator,
+    const driver = selectedXorgDriver(app.hw) orelse return try app.allocator.dupe(u8, "");
+    const bus = hwPrimaryBus(app.hw);
+    if (bus.len > 0) {
+        return try std.fmt.allocPrint(app.allocator,
             \\Section "Device"
-            \\    Identifier "tkvnbsd intel modesetting"
-            \\    Driver "modesetting"
+            \\    Identifier "tkvnbsd primary gpu"
+            \\    Driver "{s}"
+            \\    BusID "{s}"
             \\EndSection
-        , .{}),
-        .vm => try std.fmt.allocPrint(app.allocator,
-            \\Section "Device"
-            \\    Identifier "tkvnbsd vm video"
-            \\    Driver "vesa"
-            \\EndSection
-        , .{}),
-        .unknown => try std.fmt.allocPrint(app.allocator,
-            \\Section "Device"
-            \\    Identifier "tkvnbsd generic video"
-            \\    Driver "scfb"
-            \\EndSection
-        , .{}),
-        else => try app.allocator.dupe(u8, ""),
-    };
+        , .{ driver, bus });
+    }
+    return try std.fmt.allocPrint(app.allocator,
+        \\Section "Device"
+        \\    Identifier "tkvnbsd primary gpu"
+        \\    Driver "{s}"
+        \\EndSection
+    , .{driver});
 }
 
 fn stepDrivers(app: *AppState) !void {
@@ -1355,7 +1750,7 @@ fn stepDrivers(app: *AppState) !void {
     defer app.allocator.free(rc_body);
     _ = try replaceManagedBlock(app, step, RC_CONF, rc_body);
 
-    const loader_body = loaderBodyForGpu(app.hw.gpu);
+    const loader_body = loaderBodyForHw(app.hw);
     _ = try replaceManagedBlock(app, step, LOADER_CONF, loader_body);
 
     try ensureDir("/usr/local/etc/X11/xorg.conf.d");
@@ -1397,7 +1792,7 @@ fn stepDrivers(app: *AppState) !void {
         try runBestEffort(app, step, "loading cuse module for webcamd", "kldstat -m cuse >/dev/null 2>&1 || kldload cuse");
     }
 
-    if (driverModuleName(app.hw.gpu)) |modname| {
+    if (driverModuleName(app.hw)) |modname| {
         const kld_cmd = try std.fmt.allocPrint(app.allocator, "kldstat -m {s} >/dev/null 2>&1 || kldload {s}", .{ modname, modname });
         defer app.allocator.free(kld_cmd);
         try runBestEffort(app, step, "loading graphics module for current boot", kld_cmd);
@@ -1415,8 +1810,16 @@ fn stepDrivers(app: *AppState) !void {
     if (app.hw.gpu == .unknown) {
         try appendWarning(app, "unknown GPU; generic X11 video path selected", .{});
     }
-    if (app.hw.gpu == .intel) {
-        try appendWarning(app, "Intel graphics configured for drm-kmod + modesetting; legacy xf86-video-intel is removed when present because it can conflict with modern Intel UHD setups", .{});
+    if (app.hw.gpu_hybrid) {
+        const hybrid_msg = try std.fmt.allocPrint(app.allocator, "multiple GPUs detected; primary Xorg path was pinned to {s} on {s} to avoid hybrid-graphics misselection", .{ hwPrimaryModel(app.hw), hwPrimaryBus(app.hw) });
+        defer app.allocator.free(hybrid_msg);
+        try writeLog(app, step, hybrid_msg);
+    }
+    const strategy_msg = try std.fmt.allocPrint(app.allocator, "graphics evaluation selected strategy: {s} ({s})", .{ gpuStrategyName(app.hw.gpu_strategy), hwGpuReason(app.hw) });
+    defer app.allocator.free(strategy_msg);
+    try writeLog(app, step, strategy_msg);
+    if (app.hw.gpu == .intel and app.hw.gpu_strategy == .intel_scfb) {
+        try appendWarning(app, "Intel graphics was downgraded to SCFB fallback because a prior modesetting-related Xorg crash marker was found", .{});
     }
 
     app.last_completed = .drivers;
@@ -1601,14 +2004,24 @@ fn stepProbe(app: *AppState) !void {
     defer app.allocator.free(xservers_expect);
     _ = try probeFileContains(app, "XDM Xservers local display entry", XDM_XSERVERS, xservers_expect);
     _ = try probeFileContains(app, "XDM Xsession launches vtwm", XDM_XSESSION, "/usr/local/bin/vtwm");
-    if (app.hw.gpu == .intel) {
-        _ = try probeFileExists(app, "Intel modesetting config present", GPU_CONF);
-        _ = try probeFileContains(app, "Intel modesetting config selects modesetting", GPU_CONF, "Driver \"modesetting\"");
-        if (try pkgInstalled(app, "xf86-video-intel")) {
-            try appendProbeNote(app, "[warn] legacy xf86-video-intel is still installed; Intel UHD should prefer modesetting", .{});
-        } else {
-            try appendProbeNote(app, "[ok] legacy xf86-video-intel is not installed", .{});
+    if (selectedXorgDriver(app.hw)) |driver| {
+        _ = try probeFileExists(app, "managed GPU config present", GPU_CONF);
+        const driver_expect = try std.fmt.allocPrint(app.allocator, "Driver \"{s}\"", .{driver});
+        defer app.allocator.free(driver_expect);
+        _ = try probeFileContains(app, "managed GPU config selects expected driver", GPU_CONF, driver_expect);
+        if (hwPrimaryBus(app.hw).len > 0) {
+            const bus_expect = try std.fmt.allocPrint(app.allocator, "BusID \"{s}\"", .{hwPrimaryBus(app.hw)});
+            defer app.allocator.free(bus_expect);
+            _ = try probeFileContains(app, "managed GPU config pins expected bus", GPU_CONF, bus_expect);
         }
+    }
+    try appendProbeNote(app, "[info] graphics strategy: {s}", .{gpuStrategyName(app.hw.gpu_strategy)});
+    if (hwGpuReason(app.hw).len > 0) try appendProbeNote(app, "[info] graphics reason: {s}", .{hwGpuReason(app.hw)});
+    if (app.hw.gpu_hybrid) {
+        try appendProbeNote(app, "[info] hybrid graphics detected; primary={s} secondary={s}", .{ hwPrimaryModel(app.hw), hwSecondaryModel(app.hw) });
+    }
+    if (app.hw.gpu == .intel and try pkgInstalled(app, "xf86-video-intel")) {
+        try appendProbeNote(app, "[warn] legacy xf86-video-intel is still installed; Intel UHD should usually avoid it", .{});
     }
 
     const user_xsession = try std.fmt.allocPrint(app.allocator, "{s}/.xsession", .{app.home_dir.?});
@@ -1720,16 +2133,27 @@ fn stepValidate(app: *AppState) !ValidationResult {
         vr.warnings += 1;
         try appendWarning(app, "target user is not in video group", .{});
     }
-    if (app.hw.gpu == .intel) {
-        if (!fileExists(GPU_CONF) or !(try fileContains(GPU_CONF, "Driver \"modesetting\"", app.allocator))) {
+    if (selectedXorgDriver(app.hw)) |driver| {
+        const driver_expect = try std.fmt.allocPrint(app.allocator, "Driver \"{s}\"", .{driver});
+        defer app.allocator.free(driver_expect);
+        if (!fileExists(GPU_CONF) or !(try fileContains(GPU_CONF, driver_expect, app.allocator))) {
             vr.ok = false;
             vr.warnings += 1;
-            try appendWarning(app, "Intel graphics is missing the managed modesetting device config", .{});
+            try appendWarning(app, "managed GPU config does not contain the expected Xorg driver selection", .{});
         }
-        if (try pkgInstalled(app, "xf86-video-intel")) {
-            vr.warnings += 1;
-            try appendWarning(app, "legacy xf86-video-intel is still installed; Intel UHD should prefer drm-kmod + modesetting", .{});
+        if (hwPrimaryBus(app.hw).len > 0) {
+            const bus_expect = try std.fmt.allocPrint(app.allocator, "BusID \"{s}\"", .{hwPrimaryBus(app.hw)});
+            defer app.allocator.free(bus_expect);
+            if (!(try fileContains(GPU_CONF, bus_expect, app.allocator))) {
+                vr.ok = false;
+                vr.warnings += 1;
+                try appendWarning(app, "managed GPU config does not pin the expected GPU BusID", .{});
+            }
         }
+    }
+    if (app.hw.gpu == .intel and try pkgInstalled(app, "xf86-video-intel")) {
+        vr.warnings += 1;
+        try appendWarning(app, "legacy xf86-video-intel is still installed; modern Intel UHD paths usually prefer KMS plus modesetting or SCFB fallback", .{});
     }
     if (try pkgInstalled(app, "webcamd") and !(try groupHasUser(app, "webcamd"))) {
         vr.ok = false;
@@ -1749,7 +2173,7 @@ fn stepValidate(app: *AppState) !ValidationResult {
             try appendWarning(app, "managed sysctl block not found", .{});
         }
     }
-    if (driverModuleName(app.hw.gpu) != null and !(try fileContains(LOADER_CONF, MarkerBegin, app.allocator))) {
+    if (driverModuleName(app.hw) != null and !(try fileContains(LOADER_CONF, MarkerBegin, app.allocator))) {
         vr.ok = false;
         vr.warnings += 1;
         try appendWarning(app, "graphics loader block not found in loader.conf", .{});
@@ -1774,7 +2198,7 @@ fn stepValidate(app: *AppState) !ValidationResult {
         vr.warnings += 1;
         try appendWarning(app, "powerd flags are missing from rc.conf", .{});
     }
-    if (driverModuleName(app.hw.gpu)) |modname| {
+    if (driverModuleName(app.hw)) |modname| {
         const kld_expect = try std.fmt.allocPrint(app.allocator, "kld_list=\"${{kld_list}} {s}\"", .{modname});
         defer app.allocator.free(kld_expect);
         if (!(try fileContains(RC_CONF, kld_expect, app.allocator))) {
@@ -1853,7 +2277,7 @@ fn resultScreen(app: *AppState, vr: ValidationResult) void {
     uiPrintf(5, 4, "Packages installed successfully this run: {d}", .{app.installed_packages.items.len});
     uiPrintf(6, 4, "Package checksum verification: {s}", .{if (app.checksum_enabled) "enabled" else "disabled"});
     uiPrint(8, 4, "Stages completed: preflight, detect, sysctl, packages, drivers, xdm, vtwm, probe, validate");
-    uiPrint(9, 4, "Desktop post-config applied: sysctl profile, powerd, desktop groups, Xorg input/layout, graphics modules, rc.conf XDM enablement with empty xdm_flags, managed Xservers/Xsession pinned to a visible vt, vtwm user session, and Intel modesetting when detected.");
+    uiPrint(9, 4, "Desktop post-config applied: sysctl profile, powerd, desktop groups, Xorg input/layout, graphics modules, rc.conf XDM enablement with empty xdm_flags, managed Xservers/Xsession pinned to a visible vt, vtwm user session, and strategy-driven GPU selection based on detected vendor/model/bus/topology.");
     uiPrint(10, 4, "Validation / simulation checks:");
     var row: i32 = 11;
     if (app.probe_notes.items.len == 0) {
