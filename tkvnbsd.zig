@@ -1326,32 +1326,32 @@ fn stepXdm(app: *AppState) !void {
     try ensureTtysXdm(app, step);
 
     const xservers_body =
-        \# BEGIN TKVNBSD
-        \:0 local /usr/local/bin/X vt9 -nolisten tcp
-        \# END TKVNBSD
+        \\# BEGIN TKVNBSD
+        \\:0 local /usr/local/bin/X vt9 -nolisten tcp
+        \\# END TKVNBSD
     ;
     _ = try writeFileIfDifferent(app, step, XDM_XSERVERS, xservers_body);
 
     const xsetup_body =
-        \#!/bin/sh
-        \# BEGIN TKVNBSD
-        \xsetroot -solid '#202630'
-        \# END TKVNBSD
+        \\#!/bin/sh
+        \\# BEGIN TKVNBSD
+        \\xsetroot -solid '#202630'
+        \\# END TKVNBSD
     ;
     _ = try writeFileIfDifferent(app, step, XDM_XSETUP, xsetup_body);
     try ensureExecutable(app, step, XDM_XSETUP);
 
     const xsession_body =
-        \#!/bin/sh
-        \# BEGIN TKVNBSD
-        \if [ -r "$HOME/.xsession" ]; then
-        \    exec /bin/sh "$HOME/.xsession"
-        \fi
-        \if [ -r "$HOME/.xinitrc" ]; then
-        \    exec /bin/sh "$HOME/.xinitrc"
-        \fi
-        \exec vtwm
-        \# END TKVNBSD
+        \\#!/bin/sh
+        \\# BEGIN TKVNBSD
+        \\if [ -r "$HOME/.xsession" ]; then
+        \\    exec /bin/sh "$HOME/.xsession"
+        \\fi
+        \\if [ -r "$HOME/.xinitrc" ]; then
+        \\    exec /bin/sh "$HOME/.xinitrc"
+        \\fi
+        \\exec vtwm
+        \\# END TKVNBSD
     ;
     _ = try writeFileIfDifferent(app, step, XDM_XSESSION, xsession_body);
     try ensureExecutable(app, step, XDM_XSESSION);
