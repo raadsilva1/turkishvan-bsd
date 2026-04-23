@@ -538,7 +538,7 @@ fn runCommandMonitored(app: *AppState, step: Step, action: []const u8, command: 
         defer app.allocator.free(status);
         setStatus(app, status);
         spin_idx = (spin_idx + 1) % spinners.len;
-        std.time.sleep(250 * std.time.ns_per_ms);
+        std.Thread.sleep(250 * std.time.ns_per_ms);
     }
 
     const rc_text = try readFileAlloc(app.allocator, rc_path, 128);
