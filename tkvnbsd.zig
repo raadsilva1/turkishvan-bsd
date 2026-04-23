@@ -104,6 +104,7 @@ const AppState = struct {
     last_status_len: usize = 0,
     warnings: std.array_list.Managed([]u8),
     installed_packages: std.array_list.Managed([]u8),
+    checksum_enabled: bool = true,
 
     fn init(allocator: Allocator) AppState {
         return .{
@@ -868,10 +869,11 @@ fn inputScreen(app: *AppState) !bool {
     var focus: usize = 0;
     while (true) {
         drawFrame("tkvnbsd - input");
-        uiPrint(4, 4, "Provide the target desktop account and X11 keyboard layout.");
+        uiPrint(4, 4, "Provide the target desktop account, X11 keyboard layout, and optional package checksum behavior.");
         uiPrintf(7, 6, "[{s}] Username: {s}", .{ if (focus == 0) "*" else " ", if (app.username) |v| v else "<unset>" });
         uiPrintf(9, 6, "[{s}] Keyboard: {s}", .{ if (focus == 1) "*" else " ", if (app.keyboard) |v| v else "<unset>" });
-        uiPrintf(11, 6, "[{s}] Continue", .{if (focus == 2) "*" else " "});
+        uiPrintf(11, 6, "[{s}] Package checksum verification: {s}", .{ if (focus == 2) "*" else " ", if (app.checksum_enabled) "enabled" else "disabled" });
+        uiPrintf(13, 6, "[{s}] Continue", .{if (focus == 3) "*" else " "});
         _ = c.refresh();
 
         const ch = c.getch();
@@ -881,8 +883,8 @@ fn inputScreen(app: *AppState) !bool {
                 uiPrintf(c.LINES - 4, 4, "Log path: {s}", .{LOG_PATH});
                 _ = c.refresh();
             },
-            c.KEY_UP => focus = if (focus == 0) 2 else focus - 1,
-            c.KEY_DOWN, 9 => focus = (focus + 1) % 3,
+            c.KEY_UP => focus = if (focus == 0) 3 else focus - 1,
+            c.KEY_DOWN, 9 => focus = (focus + 1) % 4,
             10, 13, c.KEY_ENTER => {
                 if (focus == 0) {
                     const entered = try promptText(app, "username", "Existing local username", app.username);
@@ -892,15 +894,21 @@ fn inputScreen(app: *AppState) !bool {
                     const entered = try promptText(app, "keyboard", "X11 keyboard layout", app.keyboard);
                     defer app.allocator.free(entered);
                     if (entered.len > 0) try setOwnedString(app.allocator, &app.keyboard, entered);
+                } else if (focus == 2) {
+                    app.checksum_enabled = !app.checksum_enabled;
                 } else if (app.username != null and app.keyboard != null) {
                     return true;
+                }
+            },
+            ' ' => {
+                if (focus == 2) {
+                    app.checksum_enabled = !app.checksum_enabled;
                 }
             },
             else => {},
         }
     }
 }
-
 fn boolPrompt(title: []const u8, question: []const u8) bool {
     drawFrame(title);
     uiPrint(5, 4, question);
@@ -943,13 +951,15 @@ fn screenSummary(app: *AppState, resume_from: Step) bool {
     drawFrame("tkvnbsd - summary");
     uiPrintf(4, 4, "User: {s}", .{app.username.?});
     uiPrintf(5, 4, "Keyboard: {s}", .{app.keyboard.?});
-    uiPrintf(6, 4, "Resume from: {s}", .{stepName(resume_from)});
-    uiPrint(8, 4, "The tool will:");
-    uiPrint(9, 6, "- apply managed sysctl desktop tuning");
-    uiPrint(10, 6, "- install desktop, productivity, and multimedia packages");
-    uiPrint(11, 6, "- configure graphics/audio/input basics");
-    uiPrint(12, 6, "- enable XDM");
-    uiPrint(13, 6, "- create a vtwm session path for the target user when safe");
+    uiPrintf(6, 4, "Package checksum verification: {s}", .{if (app.checksum_enabled) "enabled" else "disabled"});
+    uiPrintf(7, 4, "Resume from: {s}", .{stepName(resume_from)});
+    uiPrint(9, 4, "The tool will:");
+    uiPrint(10, 6, "- apply managed sysctl desktop tuning");
+    uiPrint(11, 6, "- install desktop, productivity, and multimedia packages");
+    uiPrint(12, 6, "- configure graphics/audio/input basics");
+    uiPrint(13, 6, "- enable XDM");
+    uiPrint(14, 6, "- create a vtwm session path for the target user when safe");
+    uiPrint(15, 6, if (app.checksum_enabled) "- run package checksum verification" else "- skip package checksum verification");
     while (true) {
         const ch = c.getch();
         switch (ch) {
@@ -963,12 +973,12 @@ fn screenSummary(app: *AppState, resume_from: Step) bool {
         }
     }
 }
-
 fn saveState(app: *AppState, step: Step) !void {
     var data = std.array_list.Managed(u8).init(app.allocator);
     defer data.deinit();
     if (app.username) |u| try data.writer().print("username={s}\n", .{u});
     if (app.keyboard) |k| try data.writer().print("keyboard={s}\n", .{k});
+    try data.writer().print("checksum_enabled={s}\n", .{if (app.checksum_enabled) "yes" else "no"});
     try data.writer().print("step={s}\nstatus=done\n", .{stepName(step)});
     const slice = try data.toOwnedSlice();
     defer app.allocator.free(slice);
@@ -989,12 +999,12 @@ fn loadState(app: *AppState) !bool {
             const value = line[idx + 1 ..];
             if (std.mem.eql(u8, key, "username")) try setOwnedString(app.allocator, &app.username, value)
             else if (std.mem.eql(u8, key, "keyboard")) try setOwnedString(app.allocator, &app.keyboard, value)
+            else if (std.mem.eql(u8, key, "checksum_enabled")) app.checksum_enabled = std.mem.eql(u8, value, "yes")
             else if (std.mem.eql(u8, key, "step")) app.last_completed = stepFromName(value);
         }
     }
     return true;
 }
-
 fn fillUserInfo(app: *AppState) !void {
     const user = app.username orelse return error.MissingUsername;
     const zuser = try app.allocator.dupeZ(u8, user);
@@ -1171,7 +1181,11 @@ fn installPackageList(app: *AppState, step: Step, label: []const u8, list: []con
             if (run.code == 0) {
                 defer app.allocator.free(run.out);
                 try appendInstalledPackage(app, pkg);
-                try pkgIntegrityCheck(app, pkg);
+                if (app.checksum_enabled) {
+                    try pkgIntegrityCheck(app, pkg);
+                } else {
+                    try writeLog(app, step, "package checksum verification disabled by user; skipping per-package verification");
+                }
                 break :pkg_attempt;
             }
 
@@ -1554,12 +1568,16 @@ fn stepValidate(app: *AppState) !ValidationResult {
         }
     }
 
-    const pkg_check = try runCommandMonitored(app, step, "checking installed package checksums", "pkg check -q -s -a");
-    defer app.allocator.free(pkg_check.out);
-    if (pkg_check.code != 0) {
-        vr.ok = false;
-        vr.warnings += 1;
-        try appendWarning(app, "pkg checksum validation reported issues", .{});
+    if (app.checksum_enabled) {
+        const pkg_check = try runCommandMonitored(app, step, "checking installed package checksums", "pkg check -q -s -a");
+        defer app.allocator.free(pkg_check.out);
+        if (pkg_check.code != 0) {
+            vr.ok = false;
+            vr.warnings += 1;
+            try appendWarning(app, "pkg checksum validation reported issues", .{});
+        }
+    } else {
+        try writeLog(app, step, "package checksum verification disabled by user; skipping final checksum validation");
     }
 
     app.last_completed = .validate;
@@ -1616,11 +1634,12 @@ fn resultScreen(app: *AppState, vr: ValidationResult) void {
     uiPrintf(3, 4, "Validation: {s}", .{if (vr.ok) "success" else "warnings/failures present"});
     uiPrintf(4, 4, "Warnings: {d}", .{app.warnings.items.len});
     uiPrintf(5, 4, "Packages installed successfully this run: {d}", .{app.installed_packages.items.len});
-    uiPrint(7, 4, "Stages completed: preflight, detect, sysctl, packages, drivers, xdm, vtwm, validate");
-    uiPrint(8, 4, "Desktop post-config applied: sysctl profile, powerd, desktop groups, Xorg input/layout, graphics modules, rc.conf XDM enablement, managed Xservers/Xsession, vtwm user session.");
-    uiPrint(9, 4, "Installed packages:");
+    uiPrintf(6, 4, "Package checksum verification: {s}", .{if (app.checksum_enabled) "enabled" else "disabled"});
+    uiPrint(8, 4, "Stages completed: preflight, detect, sysctl, packages, drivers, xdm, vtwm, validate");
+    uiPrint(9, 4, "Desktop post-config applied: sysctl profile, powerd, desktop groups, Xorg input/layout, graphics modules, rc.conf XDM enablement, managed Xservers/Xsession, vtwm user session.");
+    uiPrint(10, 4, "Installed packages:");
 
-    const start_row: i32 = 10;
+    const start_row: i32 = 11;
     const end_row: i32 = c.LINES - 6;
     const usable_rows: usize = if (end_row > start_row) @intCast(end_row - start_row + 1) else 1;
     const col_width: i32 = @divTrunc(c.COLS - 8, 3);
