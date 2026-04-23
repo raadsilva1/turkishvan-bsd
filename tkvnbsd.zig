@@ -522,12 +522,19 @@ fn runCommandMonitored(app: *AppState, step: Step, action: []const u8, command: 
     const start_ns = std.time.nanoTimestamp();
 
     while (!fileExists(rc_path)) {
+        var detail_copy: ?[]u8 = null;
+        defer if (detail_copy) |buf| app.allocator.free(buf);
+
         var detail: []const u8 = "";
         if (fileExists(out_path)) {
             const partial = readFileAlloc(app.allocator, out_path, 1024 * 1024) catch null;
             if (partial) |p| {
                 defer app.allocator.free(p);
-                detail = lastNonEmptyLine(p);
+                const last = lastNonEmptyLine(p);
+                if (last.len > 0) {
+                    detail_copy = try app.allocator.dupe(u8, last);
+                    detail = detail_copy.?;
+                }
             }
         }
         const elapsed_s = @divTrunc(std.time.nanoTimestamp() - start_ns, std.time.ns_per_s);
