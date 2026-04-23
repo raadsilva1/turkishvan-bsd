@@ -597,8 +597,8 @@ fn uiPrint(row: i32, col: i32, text: []const u8) void {
 }
 
 fn uiPrintf(row: i32, col: i32, comptime fmt: []const u8, args: anytype) void {
-    var buf: [512]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    const s = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch return;
+    defer std.heap.page_allocator.free(s);
     uiPrint(row, col, s);
 }
 
