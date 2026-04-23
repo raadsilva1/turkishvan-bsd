@@ -93,12 +93,12 @@ const AppState = struct {
     current_command_len: usize = 0,
     last_status: [256]u8 = [_]u8{0} ** 256,
     last_status_len: usize = 0,
-    warnings: std.array_list.Managed([]u8),
+    warnings: std.ArrayList([]u8),
 
     fn init(allocator: Allocator) AppState {
         return .{
             .allocator = allocator,
-            .warnings = std.array_list.Managed([]u8).init(allocator),
+            .warnings = std.ArrayList([]u8).init(allocator),
         };
     }
 
@@ -376,7 +376,7 @@ fn replaceManagedBlock(app: *AppState, step: Step, path: []const u8, body: []con
     const desired_block = try std.fmt.allocPrint(app.allocator, "{s}\n{s}\n{s}\n", .{ MarkerBegin, trimAscii(body), MarkerEnd });
     defer app.allocator.free(desired_block);
 
-    var out = std.array_list.Managed(u8).init(app.allocator);
+    var out = std.ArrayList(u8).init(app.allocator);
     defer out.deinit();
 
     if (existing.len == 0) {
@@ -452,15 +452,13 @@ fn writeLog(app: *AppState, step: Step, message: []const u8) !void {
 }
 
 fn runCapture(allocator: Allocator, command: []const u8) !CmdResult {
-    const wrapped_tmp = try std.fmt.allocPrint(allocator, "{s} 2>&1", .{command});
-    defer allocator.free(wrapped_tmp);
-    const wrapped = try allocator.dupeZ(u8, wrapped_tmp);
+    const wrapped = try std.fmt.allocPrintZ(allocator, "{s} 2>&1", .{command});
     defer allocator.free(wrapped);
 
     const fp = c.popen(wrapped.ptr, "r");
     if (fp == null) return error.POpenFailed;
 
-    var out = std.array_list.Managed(u8).init(allocator);
+    var out = std.ArrayList(u8).init(allocator);
     var buf: [512]u8 = undefined;
     while (c.fgets(@as([*c]u8, @ptrCast(&buf)), @as(c_int, @intCast(buf.len)), fp) != null) {
         const line = std.mem.span(@as([*:0]u8, @ptrCast(&buf)));
@@ -469,8 +467,104 @@ fn runCapture(allocator: Allocator, command: []const u8) !CmdResult {
 
     const status = c.pclose(fp);
     var code: i32 = status;
-    if (status >= 0) code = @as(i32, @intCast((@as(u32, @bitCast(status)) >> 8) & 0xff));
+    if (c.WIFEXITED(status) != 0) code = c.WEXITSTATUS(status);
     return .{ .code = code, .out = try out.toOwnedSlice() };
+}
+
+fn lastNonEmptyLine(text: []const u8) []const u8 {
+    var end = text.len;
+    while (end > 0 and (text[end - 1] == '\n' or text[end - 1] == '\r' or text[end - 1] == ' ' or text[end - 1] == '\t')) : (end -= 1) {}
+    while (end > 0) {
+        var start = end;
+        while (start > 0 and text[start - 1] != '\n') : (start -= 1) {}
+        const line = trimAscii(text[start..end]);
+        if (line.len > 0) return line;
+        if (start == 0) break;
+        end = start - 1;
+        while (end > 0 and (text[end - 1] == '\n' or text[end - 1] == '\r')) : (end -= 1) {}
+    }
+    return "";
+}
+
+fn runCommandMonitored(app: *AppState, step: Step, action: []const u8, command: []const u8) !CmdResult {
+    setAction(app, step, action);
+    setCommand(app, command);
+    try writeLog(app, step, action);
+    const cmd_msg = try std.fmt.allocPrint(app.allocator, "command: {s}", .{command});
+    defer app.allocator.free(cmd_msg);
+    try writeLog(app, step, cmd_msg);
+
+    const stamp = std.time.nanoTimestamp();
+    const script_path = try std.fmt.allocPrint(app.allocator, "/var/tmp/tkvnbsd-{d}.sh", .{stamp});
+    defer app.allocator.free(script_path);
+    const out_path = try std.fmt.allocPrint(app.allocator, "/var/tmp/tkvnbsd-{d}.out", .{stamp});
+    defer app.allocator.free(out_path);
+    const rc_path = try std.fmt.allocPrint(app.allocator, "/var/tmp/tkvnbsd-{d}.rc", .{stamp});
+    defer app.allocator.free(rc_path);
+
+    const script_body = try std.fmt.allocPrint(app.allocator,
+        "#!/bin/sh\n({s}) > {s} 2>&1\nrc=$?\nprintf '%s\\n' \"$rc\" > {s}\n",
+        .{ command, out_path, rc_path }
+    );
+    defer app.allocator.free(script_body);
+    try writeFile(script_path, script_body);
+
+    const launch_cmd = try std.fmt.allocPrint(app.allocator, "sh {s} >/dev/null 2>&1 &", .{script_path});
+    defer app.allocator.free(launch_cmd);
+    const launch = try runCapture(app.allocator, launch_cmd);
+    defer app.allocator.free(launch.out);
+    if (launch.code != 0) return error.CommandLaunchFailed;
+
+    const spinners = [_][]const u8{ "|", "/", "-", "\\" };
+    var spin_idx: usize = 0;
+    const start_ns = std.time.nanoTimestamp();
+
+    while (!fileExists(rc_path)) {
+        var detail: []const u8 = "";
+        if (fileExists(out_path)) {
+            const partial = readFileAlloc(app.allocator, out_path, 1024 * 1024) catch null;
+            if (partial) |p| {
+                defer app.allocator.free(p);
+                detail = lastNonEmptyLine(p);
+            }
+        }
+        const elapsed_s = @divTrunc(std.time.nanoTimestamp() - start_ns, std.time.ns_per_s);
+        const status = if (detail.len > 0)
+            try std.fmt.allocPrint(app.allocator, "running {s} {d}s :: {s}", .{ spinners[spin_idx], elapsed_s, detail })
+        else
+            try std.fmt.allocPrint(app.allocator, "running {s} {d}s", .{ spinners[spin_idx], elapsed_s });
+        defer app.allocator.free(status);
+        setStatus(app, status);
+        spin_idx = (spin_idx + 1) % spinners.len;
+        std.time.sleep(250 * std.time.ns_per_ms);
+    }
+
+    const rc_text = try readFileAlloc(app.allocator, rc_path, 128);
+    defer app.allocator.free(rc_text);
+    const code = std.fmt.parseInt(i32, trimAscii(rc_text), 10) catch 1;
+
+    const out = if (fileExists(out_path))
+        try readFileAlloc(app.allocator, out_path, 8 * 1024 * 1024)
+    else
+        try app.allocator.dupe(u8, "");
+
+    std.fs.cwd().deleteFile(script_path) catch {};
+    std.fs.cwd().deleteFile(rc_path) catch {};
+    std.fs.cwd().deleteFile(out_path) catch {};
+
+    if (code == 0) {
+        const ok_msg = try std.fmt.allocPrint(app.allocator, "ok: {s}", .{action});
+        defer app.allocator.free(ok_msg);
+        setStatus(app, "ok");
+        try writeLog(app, step, ok_msg);
+    } else {
+        const fail_msg = try std.fmt.allocPrint(app.allocator, "failed ({d}): {s} :: {s}", .{ code, action, trimAscii(out) });
+        defer app.allocator.free(fail_msg);
+        setStatus(app, "failed");
+        try writeLog(app, step, fail_msg);
+    }
+
+    return .{ .code = code, .out = out };
 }
 
 fn runCommand(app: *AppState, step: Step, action: []const u8, command: []const u8) !CmdResult {
@@ -632,7 +726,7 @@ fn screenSummary(app: *AppState, resume_from: Step) bool {
 }
 
 fn saveState(app: *AppState, step: Step) !void {
-    var data = std.array_list.Managed(u8).init(app.allocator);
+    var data = std.ArrayList(u8).init(app.allocator);
     defer data.deinit();
     if (app.username) |u| try data.writer().print("username={s}\n", .{u});
     if (app.keyboard) |k| try data.writer().print("keyboard={s}\n", .{k});
@@ -677,10 +771,34 @@ fn detectGpuFromText(text: []const u8) GpuVendor {
     const lower = std.heap.page_allocator.dupe(u8, text) catch return .unknown;
     defer std.heap.page_allocator.free(lower);
     for (lower) |*ch| ch.* = std.ascii.toLower(ch.*);
-    if (std.mem.indexOf(u8, lower, "intel") != null) return .intel;
-    if (std.mem.indexOf(u8, lower, "advanced micro devices") != null or std.mem.indexOf(u8, lower, "amd") != null or std.mem.indexOf(u8, lower, "radeon") != null) return .amd;
-    if (std.mem.indexOf(u8, lower, "nvidia") != null) return .nvidia;
-    if (std.mem.indexOf(u8, lower, "virtio") != null or std.mem.indexOf(u8, lower, "vmware") != null or std.mem.indexOf(u8, lower, "virtualbox") != null or std.mem.indexOf(u8, lower, "qxl") != null or std.mem.indexOf(u8, lower, "bochs") != null) return .vm;
+
+    if (std.mem.indexOf(u8, lower, "intel corporation") != null or
+        std.mem.indexOf(u8, lower, "uhd graphics") != null or
+        std.mem.indexOf(u8, lower, "hd graphics") != null or
+        std.mem.indexOf(u8, lower, "iris xe") != null or
+        std.mem.indexOf(u8, lower, "iris graphics") != null or
+        std.mem.indexOf(u8, lower, "intel") != null)
+        return .intel;
+
+    if (std.mem.indexOf(u8, lower, "advanced micro devices") != null or
+        std.mem.indexOf(u8, lower, "amd/ati") != null or
+        std.mem.indexOf(u8, lower, "amd") != null or
+        std.mem.indexOf(u8, lower, "radeon") != null)
+        return .amd;
+
+    if (std.mem.indexOf(u8, lower, "nvidia") != null or
+        std.mem.indexOf(u8, lower, "geforce") != null or
+        std.mem.indexOf(u8, lower, "quadro") != null)
+        return .nvidia;
+
+    if (std.mem.indexOf(u8, lower, "virtio") != null or
+        std.mem.indexOf(u8, lower, "vmware") != null or
+        std.mem.indexOf(u8, lower, "virtualbox") != null or
+        std.mem.indexOf(u8, lower, "qxl") != null or
+        std.mem.indexOf(u8, lower, "bochs") != null or
+        std.mem.indexOf(u8, lower, "hyper-v") != null)
+        return .vm;
+
     return .unknown;
 }
 
@@ -701,7 +819,7 @@ fn stepPreflight(app: *AppState) !void {
 fn stepDetect(app: *AppState) !void {
     const step: Step = .detect;
     {
-        const res = try runCommand(app, step, "probing GPU", "pciconf -lv | egrep -i 'vg[a-z]|display|3d'");
+        const res = try runCommand(app, step, "probing GPU", "pciconf -lv | grep -A4 -E '^((vgapci|drmn)[0-9]+@)' || true");
         defer app.allocator.free(res.out);
         app.hw.gpu = detectGpuFromText(res.out);
     }
@@ -733,7 +851,7 @@ fn stepDetect(app: *AppState) !void {
 
 fn buildSysctlBody(app: *AppState) ![]u8 {
     const entries = if (std.mem.eql(u8, app.hw.profile(), "safe")) safe_sysctls[0..] else desktop_sysctls[0..];
-    var body = std.array_list.Managed(u8).init(app.allocator);
+    var body = std.ArrayList(u8).init(app.allocator);
     errdefer body.deinit();
     try body.writer().print("# managed desktop tuning profile: {s}\n", .{app.hw.profile()});
     for (entries) |entry| {
@@ -777,7 +895,7 @@ fn ensurePkgBootstrap(app: *AppState) !void {
     const check = try runCommand(app, .packages, "checking pkg bootstrap", "pkg info -e pkg");
     defer app.allocator.free(check.out);
     if (check.code == 0) return;
-    const boot = try runCommand(app, .packages, "bootstrapping pkg", "env ASSUME_ALWAYS_YES=yes pkg bootstrap");
+    const boot = try runCommandMonitored(app, .packages, "bootstrapping pkg", "env ASSUME_ALWAYS_YES=yes BATCH=yes pkg bootstrap");
     defer app.allocator.free(boot.out);
     if (boot.code != 0) return error.PkgBootstrapFailed;
 }
@@ -803,15 +921,15 @@ fn installPackageList(app: *AppState, step: Step, label: []const u8, list: []con
         return;
     }
 
-    var cmd = std.array_list.Managed(u8).init(app.allocator);
-    defer cmd.deinit();
-    try cmd.appendSlice("env ASSUME_ALWAYS_YES=yes pkg install -y");
-    for (needed.items) |pkg| {
-        try cmd.writer().print(" {s}", .{pkg});
+    for (needed.items, 0..) |pkg, idx| {
+        const action = try std.fmt.allocPrint(app.allocator, "{s} ({d}/{d})", .{ label, idx + 1, needed.items.len });
+        defer app.allocator.free(action);
+        const cmd = try std.fmt.allocPrint(app.allocator, "env ASSUME_ALWAYS_YES=yes BATCH=yes pkg install -y {s}", .{pkg});
+        defer app.allocator.free(cmd);
+        const run = try runCommandMonitored(app, step, action, cmd);
+        defer app.allocator.free(run.out);
+        if (run.code != 0) return error.PackageInstallFailed;
     }
-    const run = try runCommand(app, step, label, cmd.items);
-    defer app.allocator.free(run.out);
-    if (run.code != 0) return error.PackageInstallFailed;
 }
 
 fn stepPackages(app: *AppState) !void {
@@ -1078,6 +1196,7 @@ fn runStepWithRetry(app: *AppState, step: Step) !void {
             .vtwm => stepVtwm(app),
             else => return,
         };
+
         step_result catch |err| {
             const name = @errorName(err);
             const msg = try std.fmt.allocPrint(app.allocator, "step {s} error: {s}", .{ stepName(step), name });
@@ -1086,6 +1205,7 @@ fn runStepWithRetry(app: *AppState, step: Step) !void {
             if (!retryOrQuit(app, step, name)) return err;
             continue;
         };
+
         return;
     }
 }
