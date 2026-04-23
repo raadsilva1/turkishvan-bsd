@@ -18,7 +18,7 @@ if ( $#argv >= 2 ) then
 endif
 
 if ( ! -f "$src" ) then
-    echo "$script_name: source not found: $src"
+    echo "${script_name}: source not found: $src"
     exit 1
 endif
 
@@ -41,17 +41,17 @@ set os_rel = `uname -r`
 set os_major = `echo "$os_rel" | sed -E 's/^([0-9]+).*/\1/'`
 
 if ( "$os_name" != "FreeBSD" ) then
-    echo "$script_name: this script only supports FreeBSD"
+    echo "${script_name}: this script only supports FreeBSD"
     exit 1
 endif
 
 if ( "$os_major" != "16" ) then
-    echo "$script_name: this project targets FreeBSD 16 only (detected $os_rel)"
+    echo "${script_name}: this project targets FreeBSD 16 only (detected $os_rel)"
     exit 1
 endif
 
 if ( ! -x /usr/sbin/pkg && ! -x /usr/local/sbin/pkg ) then
-    echo "$script_name: pkg is not installed"
+    echo "${script_name}: pkg is not installed"
     echo "Install pkg first, then rerun this script."
     exit 1
 endif
@@ -59,7 +59,7 @@ endif
 if ( ! -f /usr/local/sbin/pkg ) then
     # Some systems only place pkg in /usr/local/sbin after bootstrap.
     if ( $need_root && "$elevate" == "" ) then
-        echo "$script_name: package bootstrap may be required, but no doas/sudo was found."
+        echo "${script_name}: package bootstrap may be required, but no doas/sudo was found."
         echo "Run as root or install doas/sudo."
         exit 1
     endif
@@ -70,7 +70,7 @@ if ( ! -f /usr/local/sbin/pkg ) then
         env ASSUME_ALWAYS_YES=yes /usr/sbin/pkg bootstrap
     endif
     if ( $status != 0 ) then
-        echo "$script_name: pkg bootstrap failed"
+        echo "${script_name}: pkg bootstrap failed"
         exit 1
     endif
 endif
@@ -90,7 +90,7 @@ end
 
 if ( $#missing > 0 ) then
     if ( $need_root && "$elevate" == "" ) then
-        echo "$script_name: missing packages: $missing"
+        echo "${script_name}: missing packages: $missing"
         echo "Run as root or install doas/sudo so the script can resolve dependencies."
         exit 1
     endif
@@ -102,7 +102,7 @@ if ( $#missing > 0 ) then
         env ASSUME_ALWAYS_YES=yes $pkg_cmd install -y $missing
     endif
     if ( $status != 0 ) then
-        echo "$script_name: dependency installation failed"
+        echo "${script_name}: dependency installation failed"
         exit 1
     endif
 endif
@@ -115,7 +115,7 @@ else
 endif
 
 if ( "$zig_bin" == "" ) then
-    echo "$script_name: zig not found after dependency resolution"
+    echo "${script_name}: zig not found after dependency resolution"
     exit 1
 endif
 
@@ -140,18 +140,18 @@ else if ( -f /lib/libncursesw.so || -f /usr/lib/libncursesw.so ) then
 endif
 
 if ( "$ncurses_lib" == "" ) then
-    echo "$script_name: unable to locate an ncurses library"
+    echo "${script_name}: unable to locate an ncurses library"
     exit 1
 endif
 
-set out_dir = "$out:h"
+set out_dir = "${out}:h"
 if ( "$out_dir" == "" ) then
     set out_dir = "."
 endif
 if ( ! -d "$out_dir" ) then
     mkdir -p "$out_dir"
     if ( $status != 0 ) then
-        echo "$script_name: failed to create output directory: $out_dir"
+        echo "${script_name}: failed to create output directory: $out_dir"
         exit 1
     endif
 endif
@@ -171,13 +171,13 @@ echo ""
 
 $build_cmd
 if ( $status != 0 ) then
-    echo "$script_name: build failed"
+    echo "${script_name}: build failed"
     exit 1
 endif
 
 chmod 755 "$out"
 if ( $status != 0 ) then
-    echo "$script_name: build succeeded, but chmod failed for $out"
+    echo "${script_name}: build succeeded, but chmod failed for $out"
     exit 1
 endif
 
