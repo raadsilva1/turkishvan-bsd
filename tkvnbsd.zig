@@ -18,6 +18,7 @@ const LOADER_CONF = "/boot/loader.conf";
 const XKB_CONF = "/usr/local/etc/X11/xorg.conf.d/00-keyboard-tkvnbsd.conf";
 const LIBINPUT_CONF = "/usr/local/etc/X11/xorg.conf.d/20-libinput-tkvnbsd.conf";
 const XDM_XSETUP = "/usr/local/etc/X11/xdm/Xsetup_0";
+const XDM_XSESSION = "/usr/local/etc/X11/xdm/Xsession";
 
 const MarkerBegin = "# BEGIN TKVNBSD";
 const MarkerEnd = "# END TKVNBSD";
@@ -377,6 +378,102 @@ fn packageFailurePrompt(pkg: []const u8, detail: []const u8) PackageDecision {
             else => {},
         }
     }
+}
+
+
+fn runBestEffort(app: *AppState, step: Step, action: []const u8, command: []const u8) !void {
+    const res = try runCommand(app, step, action, command);
+    defer app.allocator.free(res.out);
+    if (res.code != 0) {
+        try appendWarning(app, "{s} failed: {s}", .{ action, trimAscii(res.out) });
+    }
+}
+
+fn ensureUserInGroup(app: *AppState, step: Step, group: []const u8) !void {
+    const user = app.username.?;
+    const check_cmd = try std.fmt.allocPrint(app.allocator, "id -Gn {s}", .{user});
+    defer app.allocator.free(check_cmd);
+    const check = try runCapture(app.allocator, check_cmd);
+    defer app.allocator.free(check.out);
+    if (check.code == 0) {
+        var it = std.mem.tokenizeAny(u8, trimAscii(check.out), " \t\r\n");
+        while (it.next()) |tok| {
+            if (std.mem.eql(u8, tok, group)) return;
+        }
+    }
+    const mod_cmd = try std.fmt.allocPrint(app.allocator, "pw groupmod {s} -m {s}", .{ group, user });
+    defer app.allocator.free(mod_cmd);
+    const res = try runCommand(app, step, "adding user to desktop group", mod_cmd);
+    defer app.allocator.free(res.out);
+    if (res.code != 0) return error.GroupModifyFailed;
+}
+
+fn ensureExecutable(app: *AppState, step: Step, path: []const u8) !void {
+    const cmd = try std.fmt.allocPrint(app.allocator, "chmod 755 '{s}'", .{path});
+    defer app.allocator.free(cmd);
+    const res = try runCommand(app, step, "marking file executable", cmd);
+    defer app.allocator.free(res.out);
+    if (res.code != 0) return error.ChmodFailed;
+}
+
+fn pkgIntegrityCheck(app: *AppState, step: Step, pkg: []const u8) !void {
+    const checksum_cmd = try std.fmt.allocPrint(app.allocator, "pkg check -q -s {s}", .{pkg});
+    defer app.allocator.free(checksum_cmd);
+    const checksum = try runCapture(app.allocator, checksum_cmd);
+    defer app.allocator.free(checksum.out);
+    if (checksum.code != 0) {
+        try appendWarning(app, "package checksum verification failed for {s}", .{pkg});
+    }
+
+    const dep_cmd = try std.fmt.allocPrint(app.allocator, "pkg check -n -d {s}", .{pkg});
+    defer app.allocator.free(dep_cmd);
+    const dep = try runCapture(app.allocator, dep_cmd);
+    defer app.allocator.free(dep.out);
+    if (dep.code != 0) {
+        try appendWarning(app, "package dependency verification reported issues for {s}", .{pkg});
+    }
+}
+
+fn groupHasUser(app: *AppState, group: []const u8) !bool {
+    const user = app.username.?;
+    const check_cmd = try std.fmt.allocPrint(app.allocator, "id -Gn {s}", .{user});
+    defer app.allocator.free(check_cmd);
+    const check = try runCapture(app.allocator, check_cmd);
+    defer app.allocator.free(check.out);
+    if (check.code != 0) return false;
+    var it = std.mem.tokenizeAny(u8, trimAscii(check.out), " \t\r\n");
+    while (it.next()) |tok| {
+        if (std.mem.eql(u8, tok, group)) return true;
+    }
+    return false;
+}
+
+fn driverModuleName(gpu: GpuVendor) ?[]const u8 {
+    return switch (gpu) {
+        .intel => "i915kms",
+        .amd => "amdgpu",
+        .nvidia => "nvidia",
+        .vm, .unknown => null,
+    };
+}
+
+fn startServiceIfPresent(app: *AppState, step: Step, name: []const u8) !void {
+    const local_path = try std.fmt.allocPrint(app.allocator, "/usr/local/etc/rc.d/{s}", .{name});
+    defer app.allocator.free(local_path);
+    const base_path = try std.fmt.allocPrint(app.allocator, "/etc/rc.d/{s}", .{name});
+    defer app.allocator.free(base_path);
+    if (!fileExists(local_path) and !fileExists(base_path)) return;
+
+    const cmd = try std.fmt.allocPrint(app.allocator, "service {s} onestart", .{name});
+    defer app.allocator.free(cmd);
+    try runBestEffort(app, step, "starting desktop service", cmd);
+}
+
+fn fileContains(path: []const u8, needle: []const u8, allocator: Allocator) !bool {
+    if (!fileExists(path)) return false;
+    const content = try readFileAlloc(allocator, path, 1024 * 1024);
+    defer allocator.free(content);
+    return std.mem.indexOf(u8, content, needle) != null;
 }
 
 fn fileExists(path: []const u8) bool {
@@ -1000,6 +1097,7 @@ fn installPackageList(app: *AppState, step: Step, label: []const u8, list: []con
             if (run.code == 0) {
                 defer app.allocator.free(run.out);
                 try appendInstalledPackage(app, pkg);
+                try pkgIntegrityCheck(app, step, pkg);
                 break :pkg_attempt;
             }
 
@@ -1115,6 +1213,18 @@ fn stepDrivers(app: *AppState) !void {
     ;
     _ = try writeFileIfDifferent(app, step, LIBINPUT_CONF, libinput_body);
 
+    try ensureUserInGroup(app, step, "video");
+
+    if (driverModuleName(app.hw.gpu)) |modname| {
+        const kld_cmd = try std.fmt.allocPrint(app.allocator, "kldstat -m {s} >/dev/null 2>&1 || kldload {s}", .{ modname, modname });
+        defer app.allocator.free(kld_cmd);
+        try runBestEffort(app, step, "loading graphics module for current boot", kld_cmd);
+    }
+
+    try startServiceIfPresent(app, step, "dbus");
+    try startServiceIfPresent(app, step, "hald");
+    try startServiceIfPresent(app, step, "mixer");
+
     if (!app.hw.audio_present) {
         try appendWarning(app, "no audio device detected; audio packages/config were minimized", .{});
     }
@@ -1141,11 +1251,24 @@ fn stepXdm(app: *AppState) !void {
         \\# END TKVNBSD
     ;
     _ = try writeFileIfDifferent(app, step, XDM_XSETUP, xsetup_body);
-    {
-        const chmod_res = try runCommand(app, step, "marking Xsetup_0 executable", "chmod 755 /usr/local/etc/X11/xdm/Xsetup_0");
-        defer app.allocator.free(chmod_res.out);
-        if (chmod_res.code != 0) return error.XdmConfigFailed;
-    }
+    try ensureExecutable(app, step, XDM_XSETUP);
+
+    const xsession_body =
+        \\#!/bin/sh
+        \\# BEGIN TKVNBSD
+        \\if [ -x "$HOME/.xsession" ]; then
+        \\    exec "$HOME/.xsession"
+        \\fi
+        \\if [ -x "$HOME/.xinitrc" ]; then
+        \\    exec "$HOME/.xinitrc"
+        \\fi
+        \\exec vtwm
+        \\# END TKVNBSD
+    ;
+    _ = try writeFileIfDifferent(app, step, XDM_XSESSION, xsession_body);
+    try ensureExecutable(app, step, XDM_XSESSION);
+
+    try appendWarning(app, "xdm is fully configured and enabled for boot; it is not started live to avoid replacing the current installer console session", .{});
 
     app.last_completed = .xdm;
     try saveState(app, .xdm);
@@ -1156,19 +1279,23 @@ fn stepVtwm(app: *AppState) !void {
     const home = app.home_dir.?;
     const xsession_path = try std.fmt.allocPrint(app.allocator, "{s}/.xsession", .{home});
     defer app.allocator.free(xsession_path);
+    const xinitrc_path = try std.fmt.allocPrint(app.allocator, "{s}/.xinitrc", .{home});
+    defer app.allocator.free(xinitrc_path);
     const vtwmrc_path = try std.fmt.allocPrint(app.allocator, "{s}/.vtwmrc", .{home});
     defer app.allocator.free(vtwmrc_path);
     const xr_path = try std.fmt.allocPrint(app.allocator, "{s}/.Xdefaults", .{home});
     defer app.allocator.free(xr_path);
 
-    const xsession_body =
+    const session_body =
         \\#!/bin/sh
         \\# BEGIN TKVNBSD
+        \\export LANG="${LANG:-C.UTF-8}"
         \\[ -f "$HOME/.Xdefaults" ] && xrdb -merge "$HOME/.Xdefaults"
+        \\command -v dbus-launch >/dev/null 2>&1 && exec dbus-launch --exit-with-session vtwm
         \\exec vtwm
         \\# END TKVNBSD
     ;
-    const changed_xsession = try ensureManagedOrMissingFile(app, step, xsession_path, xsession_body);
+    const changed_xsession = try ensureManagedOrMissingFile(app, step, xsession_path, session_body);
     if (!changed_xsession and fileExists(xsession_path)) {
         const existing = try readFileAlloc(app.allocator, xsession_path, 1024 * 64);
         defer app.allocator.free(existing);
@@ -1176,12 +1303,14 @@ fn stepVtwm(app: *AppState) !void {
             try appendWarning(app, "existing .xsession kept untouched; verify it launches vtwm", .{});
         }
     }
+    _ = try ensureManagedOrMissingFile(app, step, xinitrc_path, session_body);
 
     const vtwm_body =
         \\# BEGIN TKVNBSD
         \\Menu "defops" {
         \\    "xterm"         f.exec "xterm &"
         \\    "firefox"       f.exec "firefox &"
+        \\    "editor"        f.exec "xterm -e vi &"
         \\    "restart"       f.restart
         \\    "exit"          f.quit
         \\}
@@ -1201,7 +1330,14 @@ fn stepVtwm(app: *AppState) !void {
     ;
     _ = try ensureFileIfMissing(app, xr_path, xr_body);
 
-    if (fileExists(xsession_path)) try chownUser(xsession_path, app.uid, app.gid);
+    if (fileExists(xsession_path)) {
+        try chownUser(xsession_path, app.uid, app.gid);
+        try ensureExecutable(app, step, xsession_path);
+    }
+    if (fileExists(xinitrc_path)) {
+        try chownUser(xinitrc_path, app.uid, app.gid);
+        try ensureExecutable(app, step, xinitrc_path);
+    }
     if (fileExists(vtwmrc_path)) try chownUser(vtwmrc_path, app.uid, app.gid);
     if (fileExists(xr_path)) try chownUser(xr_path, app.uid, app.gid);
 
@@ -1237,15 +1373,33 @@ fn stepValidate(app: *AppState) !ValidationResult {
 
     const xsession_path = try std.fmt.allocPrint(app.allocator, "{s}/.xsession", .{app.home_dir.?});
     defer app.allocator.free(xsession_path);
+    const xinitrc_path = try std.fmt.allocPrint(app.allocator, "{s}/.xinitrc", .{app.home_dir.?});
+    defer app.allocator.free(xinitrc_path);
+
     if (!fileExists(xsession_path)) {
         vr.ok = false;
         vr.warnings += 1;
         try appendWarning(app, "user session file is missing: {s}", .{xsession_path});
     }
+    if (!fileExists(xinitrc_path)) {
+        vr.ok = false;
+        vr.warnings += 1;
+        try appendWarning(app, "user xinitrc file is missing: {s}", .{xinitrc_path});
+    }
     if (!fileExists(XKB_CONF)) {
         vr.ok = false;
         vr.warnings += 1;
         try appendWarning(app, "keyboard config is missing: {s}", .{XKB_CONF});
+    }
+    if (!fileExists(XDM_XSESSION)) {
+        vr.ok = false;
+        vr.warnings += 1;
+        try appendWarning(app, "xdm Xsession is missing: {s}", .{XDM_XSESSION});
+    }
+    if (!(try groupHasUser(app, "video"))) {
+        vr.ok = false;
+        vr.warnings += 1;
+        try appendWarning(app, "target user is not in video group", .{});
     }
     if (!fileExists(SYSCTL_CONF)) {
         vr.ok = false;
@@ -1260,6 +1414,20 @@ fn stepValidate(app: *AppState) !ValidationResult {
             try appendWarning(app, "managed sysctl block not found", .{});
         }
     }
+    if (driverModuleName(app.hw.gpu) != null and !(try fileContains(LOADER_CONF, MarkerBegin, app.allocator))) {
+        vr.ok = false;
+        vr.warnings += 1;
+        try appendWarning(app, "graphics loader block not found in loader.conf", .{});
+    }
+
+    const pkg_check = try runCommand(app, step, "checking installed package checksums", "pkg check -q -s -a");
+    defer app.allocator.free(pkg_check.out);
+    if (pkg_check.code != 0) {
+        vr.ok = false;
+        vr.warnings += 1;
+        try appendWarning(app, "pkg checksum validation reported issues", .{});
+    }
+
     app.last_completed = .validate;
     try saveState(app, .validate);
     return vr;
@@ -1315,9 +1483,10 @@ fn resultScreen(app: *AppState, vr: ValidationResult) void {
     uiPrintf(4, 4, "Warnings: {d}", .{app.warnings.items.len});
     uiPrintf(5, 4, "Packages installed successfully this run: {d}", .{app.installed_packages.items.len});
     uiPrint(7, 4, "Stages completed: preflight, detect, sysctl, packages, drivers, xdm, vtwm, validate");
-    uiPrint(8, 4, "Installed packages:");
+    uiPrint(8, 4, "Desktop post-config applied: Xorg input/layout, graphics module enablement, XDM session wiring, vtwm user session.");
+    uiPrint(9, 4, "Installed packages:");
 
-    const start_row: i32 = 9;
+    const start_row: i32 = 10;
     const end_row: i32 = c.LINES - 6;
     const usable_rows: usize = if (end_row > start_row) @intCast(end_row - start_row + 1) else 1;
     const col_width: i32 = @divTrunc(c.COLS - 8, 3);
