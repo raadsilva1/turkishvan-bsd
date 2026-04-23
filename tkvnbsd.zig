@@ -1003,7 +1003,7 @@ fn installPackageList(app: *AppState, step: Step, label: []const u8, list: []con
                 break :pkg_attempt;
             }
 
-            const decision = packageFailurePrompt(app, pkg, trimAscii(run.out));
+            const decision = packageFailurePrompt(pkg, trimAscii(run.out));
             switch (decision) {
                 .retry => {
                     app.allocator.free(run.out);
