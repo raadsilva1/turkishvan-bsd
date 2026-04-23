@@ -19,6 +19,8 @@ const XKB_CONF = "/usr/local/etc/X11/xorg.conf.d/00-keyboard-tkvnbsd.conf";
 const LIBINPUT_CONF = "/usr/local/etc/X11/xorg.conf.d/20-libinput-tkvnbsd.conf";
 const XDM_XSETUP = "/usr/local/etc/X11/xdm/Xsetup_0";
 const XDM_XSESSION = "/usr/local/etc/X11/xdm/Xsession";
+const XDM_XSERVERS = "/usr/local/etc/X11/xdm/Xservers";
+const TTYS_PATH = "/etc/ttys";
 
 const MarkerBegin = "# BEGIN TKVNBSD";
 const MarkerEnd = "# END TKVNBSD";
@@ -474,10 +476,16 @@ fn buildDesktopRcBody(app: *AppState) ![]u8 {
         "powerd_enable=\"YES\"\npowerd_flags=\"-a hiadaptive -b adaptive -i 25 -r 85 -N\"\n"
     else
         "powerd_enable=\"YES\"\npowerd_flags=\"-a hiadaptive -n hiadaptive -i 25 -r 85 -N\"\n";
+    const kld_line = if (driverModuleName(app.hw.gpu)) |modname|
+        try std.fmt.allocPrint(app.allocator, "kld_list=\"${{kld_list}} {s}\"\n", .{modname})
+    else
+        try app.allocator.dupe(u8, "");
+
+    defer app.allocator.free(kld_line);
 
     return try std.fmt.allocPrint(app.allocator,
-        "dbus_enable=\"YES\"\nhald_enable=\"YES\"\nmixer_enable=\"YES\"\n{s}{s}",
-        .{ webcamd_line, powerd_flags },
+        "dbus_enable=\"YES\"\nhald_enable=\"YES\"\nmixer_enable=\"YES\"\n{s}{s}{s}",
+        .{ webcamd_line, powerd_flags, kld_line },
     );
 }
 
@@ -500,6 +508,39 @@ fn startServiceIfPresent(app: *AppState, step: Step, name: []const u8) !void {
     const cmd = try std.fmt.allocPrint(app.allocator, "service {s} onestart", .{name});
     defer app.allocator.free(cmd);
     try runBestEffort(app, step, "starting desktop service", cmd);
+}
+
+fn ensureTtysXdm(app: *AppState, step: Step) !void {
+    const desired = "ttyv8   \"/usr/local/bin/xdm -nodaemon\"  xterm   on  secure";
+    var existing_opt: ?[]u8 = null;
+    if (fileExists(TTYS_PATH)) {
+        existing_opt = try readFileAlloc(app.allocator, TTYS_PATH, 1024 * 1024);
+    }
+    defer if (existing_opt) |existing| app.allocator.free(existing);
+    const existing = existing_opt orelse "";
+
+    var out = std.array_list.Managed(u8).init(app.allocator);
+    defer out.deinit();
+
+    var found = false;
+    var lines = std.mem.splitScalar(u8, existing, '\n');
+    while (lines.next()) |line| {
+        const trimmed_left = std.mem.trimLeft(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed_left, "ttyv8")) {
+            try out.writer().print("{s}\n", .{desired});
+            found = true;
+        } else if (line.len > 0) {
+            try out.writer().print("{s}\n", .{line});
+        }
+    }
+    if (!found) try out.writer().print("{s}\n", .{desired});
+
+    const new_content = try out.toOwnedSlice();
+    defer app.allocator.free(new_content);
+
+    if (existing.len > 0 and std.mem.eql(u8, trimAscii(existing), trimAscii(new_content))) return;
+    try backupFile(app, TTYS_PATH, step);
+    try writeFile(TTYS_PATH, new_content);
 }
 
 fn fileContains(path: []const u8, needle: []const u8, allocator: Allocator) !bool {
@@ -1274,37 +1315,48 @@ fn stepDrivers(app: *AppState) !void {
 
 fn stepXdm(app: *AppState) !void {
     const step: Step = .xdm;
-    const enable = try runCommand(app, step, "enabling XDM with sysrc", "sysrc xdm_enable=YES");
-    defer app.allocator.free(enable.out);
-    if (enable.code != 0) return error.XdmEnableFailed;
+
+    const disable_rc = try runCommand(app, step, "disabling rc.conf xdm startup to avoid duplicate managers", "sysrc xdm_enable=NO");
+    defer app.allocator.free(disable_rc.out);
+    if (disable_rc.code != 0) {
+        try appendWarning(app, "could not force xdm_enable=NO before ttyv8 setup", .{});
+    }
 
     try ensureDir("/usr/local/etc/X11/xdm");
+    try ensureTtysXdm(app, step);
+
+    const xservers_body =
+        \# BEGIN TKVNBSD
+        \:0 local /usr/local/bin/X vt9 -nolisten tcp
+        \# END TKVNBSD
+    ;
+    _ = try writeFileIfDifferent(app, step, XDM_XSERVERS, xservers_body);
 
     const xsetup_body =
-        \\#!/bin/sh
-        \\# BEGIN TKVNBSD
-        \\xsetroot -solid '#202630'
-        \\# END TKVNBSD
+        \#!/bin/sh
+        \# BEGIN TKVNBSD
+        \xsetroot -solid '#202630'
+        \# END TKVNBSD
     ;
     _ = try writeFileIfDifferent(app, step, XDM_XSETUP, xsetup_body);
     try ensureExecutable(app, step, XDM_XSETUP);
 
     const xsession_body =
-        \\#!/bin/sh
-        \\# BEGIN TKVNBSD
-        \\if [ -x "$HOME/.xsession" ]; then
-        \\    exec "$HOME/.xsession"
-        \\fi
-        \\if [ -x "$HOME/.xinitrc" ]; then
-        \\    exec "$HOME/.xinitrc"
-        \\fi
-        \\exec vtwm
-        \\# END TKVNBSD
+        \#!/bin/sh
+        \# BEGIN TKVNBSD
+        \if [ -r "$HOME/.xsession" ]; then
+        \    exec /bin/sh "$HOME/.xsession"
+        \fi
+        \if [ -r "$HOME/.xinitrc" ]; then
+        \    exec /bin/sh "$HOME/.xinitrc"
+        \fi
+        \exec vtwm
+        \# END TKVNBSD
     ;
     _ = try writeFileIfDifferent(app, step, XDM_XSESSION, xsession_body);
     try ensureExecutable(app, step, XDM_XSESSION);
 
-    try appendWarning(app, "xdm is fully configured and enabled for boot; it is not started live to avoid replacing the current installer console session", .{});
+    try appendWarning(app, "xdm is configured through /etc/ttys ttyv8 plus Xservers/Xsession; reboot to let init start it cleanly", .{});
 
     app.last_completed = .xdm;
     try saveState(app, .xdm);
@@ -1397,14 +1449,10 @@ fn stepValidate(app: *AppState) !ValidationResult {
     try requirePkg(app, &vr, "xdm");
     try requirePkg(app, &vr, "vtwm");
 
-    {
-        const res = try runCommand(app, step, "checking xdm_enable", "sysrc -n xdm_enable");
-        defer app.allocator.free(res.out);
-        if (!std.mem.eql(u8, trimAscii(res.out), "YES")) {
-            vr.ok = false;
-            vr.warnings += 1;
-            try appendWarning(app, "xdm_enable is not YES", .{});
-        }
+    if (!(try fileContains(TTYS_PATH, "ttyv8   \"/usr/local/bin/xdm -nodaemon\"  xterm   on  secure", app.allocator))) {
+        vr.ok = false;
+        vr.warnings += 1;
+        try appendWarning(app, "ttyv8 xdm entry is missing or disabled in /etc/ttys", .{});
     }
 
     const xsession_path = try std.fmt.allocPrint(app.allocator, "{s}/.xsession", .{app.home_dir.?});
@@ -1431,6 +1479,15 @@ fn stepValidate(app: *AppState) !ValidationResult {
         vr.ok = false;
         vr.warnings += 1;
         try appendWarning(app, "xdm Xsession is missing: {s}", .{XDM_XSESSION});
+    }
+    if (!fileExists(XDM_XSERVERS)) {
+        vr.ok = false;
+        vr.warnings += 1;
+        try appendWarning(app, "xdm Xservers is missing: {s}", .{XDM_XSERVERS});
+    } else if (!(try fileContains(XDM_XSERVERS, "/usr/local/bin/X vt9", app.allocator))) {
+        vr.ok = false;
+        vr.warnings += 1;
+        try appendWarning(app, "xdm Xservers does not contain the managed local display entry", .{});
     }
     if (!(try groupHasUser(app, "video"))) {
         vr.ok = false;
@@ -1480,8 +1537,17 @@ fn stepValidate(app: *AppState) !ValidationResult {
         vr.warnings += 1;
         try appendWarning(app, "powerd flags are missing from rc.conf", .{});
     }
+    if (driverModuleName(app.hw.gpu)) |modname| {
+        const kld_expect = try std.fmt.allocPrint(app.allocator, "kld_list=\"${{kld_list}} {s}\"", .{modname});
+        defer app.allocator.free(kld_expect);
+        if (!(try fileContains(RC_CONF, kld_expect, app.allocator))) {
+            vr.ok = false;
+            vr.warnings += 1;
+            try appendWarning(app, "graphics module persistence is missing from rc.conf", .{});
+        }
+    }
 
-    const pkg_check = try runCommand(app, step, "checking installed package checksums", "pkg check -q -s -a");
+    const pkg_check = try runCommandMonitored(app, step, "checking installed package checksums", "pkg check -q -s -a");
     defer app.allocator.free(pkg_check.out);
     if (pkg_check.code != 0) {
         vr.ok = false;
@@ -1544,7 +1610,7 @@ fn resultScreen(app: *AppState, vr: ValidationResult) void {
     uiPrintf(4, 4, "Warnings: {d}", .{app.warnings.items.len});
     uiPrintf(5, 4, "Packages installed successfully this run: {d}", .{app.installed_packages.items.len});
     uiPrint(7, 4, "Stages completed: preflight, detect, sysctl, packages, drivers, xdm, vtwm, validate");
-    uiPrint(8, 4, "Desktop post-config applied: sysctl profile, powerd, desktop groups, Xorg input/layout, graphics modules, XDM session wiring, vtwm user session.");
+    uiPrint(8, 4, "Desktop post-config applied: sysctl profile, powerd, desktop groups, Xorg input/layout, graphics modules, ttyv8/XDM wiring, Xservers, vtwm user session.");
     uiPrint(9, 4, "Installed packages:");
 
     const start_row: i32 = 10;
