@@ -522,12 +522,19 @@ fn xorgLogShowsModesettingCrash(app: *AppState) !bool {
 
 fn evaluateGpuStrategy(hw: *HardwareInfo) void {
     if (hw.gpu == .intel) {
+        hw.gpu_strategy = .intel_modesetting;
         if (hw.xorg_prior_crash) {
-            hw.gpu_strategy = if (hw.boot_method_uefi) .intel_scfb else .vesa;
-            setFixed(hw.gpu_reason[0..], &hw.gpu_reason_len, "previous Xorg modesetting crash detected; selecting safe fallback for Intel");
+            setFixed(hw.gpu_reason[0..], &hw.gpu_reason_len,
+                if (hw.gpu_hybrid)
+                    "previous Xorg crash marker exists, but Intel graphics remains on the documented i915kms path; using autoconfiguration unless hybrid GPU pinning is required"
+                else
+                    "previous Xorg crash marker exists, but Intel graphics remains on the documented i915kms path; avoiding forced fallback and forced Device/BusID config");
         } else {
-            hw.gpu_strategy = .intel_modesetting;
-            setFixed(hw.gpu_reason[0..], &hw.gpu_reason_len, if (hw.gpu_hybrid) "hybrid graphics detected; preferring integrated Intel GPU for stable XDM/Xorg startup" else "single Intel GPU detected; preferring modern KMS + modesetting path");
+            setFixed(hw.gpu_reason[0..], &hw.gpu_reason_len,
+                if (hw.gpu_hybrid)
+                    "hybrid graphics detected; preferring integrated Intel GPU and only pinning BusID when needed"
+                else
+                    "single Intel GPU detected; preferring documented i915kms path with Xorg autoconfiguration");
         }
         return;
     }
@@ -1512,6 +1519,13 @@ fn stepDetect(app: *AppState) !void {
         app.hw.low_memory = app.hw.physmem_bytes > 0 and app.hw.physmem_bytes < 4 * 1024 * 1024 * 1024;
     }
     app.hw.xorg_prior_crash = try xorgLogShowsModesettingCrash(app);
+    if (fileExists("/var/log/Xorg.0.log")) {
+        const xlog = try readFileAlloc(app.allocator, "/var/log/Xorg.0.log", 1024 * 1024);
+        defer app.allocator.free(xlog);
+        if (std.mem.indexOf(u8, xlog, "no screens found") != null) {
+            try writeLog(app, step, "previous Xorg log contains 'no screens found'; avoiding forced fallback/BusID config where possible");
+        }
+    }
     evaluateGpuStrategy(&app.hw);
     app.last_completed = .detect;
 }
@@ -1716,10 +1730,26 @@ fn selectedXorgDriver(hw: HardwareInfo) ?[]const u8 {
     };
 }
 
+fn shouldWriteManagedGpuConfig(hw: HardwareInfo) bool {
+    return switch (hw.gpu_strategy) {
+        .intel_modesetting => hw.gpu_hybrid,
+        .intel_scfb => false,
+        .scfb, .vesa => false,
+        else => true,
+    };
+}
+
+
 fn buildGpuDeviceBody(app: *AppState) ![]u8 {
+    if (!shouldWriteManagedGpuConfig(app.hw)) return try app.allocator.dupe(u8, "");
+
     const driver = selectedXorgDriver(app.hw) orelse return try app.allocator.dupe(u8, "");
     const bus = hwPrimaryBus(app.hw);
-    if (bus.len > 0) {
+    const use_bus = app.hw.gpu_hybrid and bus.len > 0 and
+        !std.mem.eql(u8, driver, "scfb") and
+        !std.mem.eql(u8, driver, "vesa");
+
+    if (use_bus) {
         return try std.fmt.allocPrint(app.allocator,
             \\Section "Device"
             \\    Identifier "tkvnbsd primary gpu"
@@ -1788,6 +1818,8 @@ fn stepDrivers(app: *AppState) !void {
     defer app.allocator.free(gpu_body);
     if (gpu_body.len > 0) {
         _ = try writeFileIfDifferent(app, step, GPU_CONF, gpu_body);
+    } else {
+        try runBestEffort(app, step, "removing stale managed GPU config", "rm -f /usr/local/etc/X11/xorg.conf.d/90-video-tkvnbsd.conf");
     }
 
     try ensureUserInGroup(app, step, "video");
@@ -2009,14 +2041,19 @@ fn stepProbe(app: *AppState) !void {
     _ = try probeFileContains(app, "XDM Xservers local display entry", XDM_XSERVERS, xservers_expect);
     _ = try probeFileContains(app, "XDM Xsession launches vtwm", XDM_XSESSION, "/usr/local/bin/vtwm");
     if (selectedXorgDriver(app.hw)) |driver| {
-        _ = try probeFileExists(app, "managed GPU config present", GPU_CONF);
-        const driver_expect = try std.fmt.allocPrint(app.allocator, "Driver \"{s}\"", .{driver});
-        defer app.allocator.free(driver_expect);
-        _ = try probeFileContains(app, "managed GPU config selects expected driver", GPU_CONF, driver_expect);
-        if (hwPrimaryBus(app.hw).len > 0) {
-            const bus_expect = try std.fmt.allocPrint(app.allocator, "BusID \"{s}\"", .{hwPrimaryBus(app.hw)});
-            defer app.allocator.free(bus_expect);
-            _ = try probeFileContains(app, "managed GPU config pins expected bus", GPU_CONF, bus_expect);
+        if (shouldWriteManagedGpuConfig(app.hw)) {
+            _ = try probeFileExists(app, "managed GPU config present", GPU_CONF);
+            const driver_expect = try std.fmt.allocPrint(app.allocator, "Driver \"{s}\"", .{driver});
+            defer app.allocator.free(driver_expect);
+            _ = try probeFileContains(app, "managed GPU config selects expected driver", GPU_CONF, driver_expect);
+            if (app.hw.gpu_hybrid and hwPrimaryBus(app.hw).len > 0 and
+                !std.mem.eql(u8, driver, "scfb") and !std.mem.eql(u8, driver, "vesa")) {
+                const bus_expect = try std.fmt.allocPrint(app.allocator, "BusID \"{s}\"", .{hwPrimaryBus(app.hw)});
+                defer app.allocator.free(bus_expect);
+                _ = try probeFileContains(app, "managed GPU config pins expected bus", GPU_CONF, bus_expect);
+            }
+        } else {
+            try appendProbeNote(app, "[ok] managed GPU config intentionally omitted to let Xorg autoconfigure the primary screen", .{});
         }
     }
     try appendProbeNote(app, "[info] graphics strategy: {s}", .{gpuStrategyName(app.hw.gpu_strategy)});
@@ -2138,20 +2175,23 @@ fn stepValidate(app: *AppState) !ValidationResult {
         try appendWarning(app, "target user is not in video group", .{});
     }
     if (selectedXorgDriver(app.hw)) |driver| {
-        const driver_expect = try std.fmt.allocPrint(app.allocator, "Driver \"{s}\"", .{driver});
-        defer app.allocator.free(driver_expect);
-        if (!fileExists(GPU_CONF) or !(try fileContains(GPU_CONF, driver_expect, app.allocator))) {
-            vr.ok = false;
-            vr.warnings += 1;
-            try appendWarning(app, "managed GPU config does not contain the expected Xorg driver selection", .{});
-        }
-        if (hwPrimaryBus(app.hw).len > 0) {
-            const bus_expect = try std.fmt.allocPrint(app.allocator, "BusID \"{s}\"", .{hwPrimaryBus(app.hw)});
-            defer app.allocator.free(bus_expect);
-            if (!(try fileContains(GPU_CONF, bus_expect, app.allocator))) {
+        if (shouldWriteManagedGpuConfig(app.hw)) {
+            const driver_expect = try std.fmt.allocPrint(app.allocator, "Driver \"{s}\"", .{driver});
+            defer app.allocator.free(driver_expect);
+            if (!fileExists(GPU_CONF) or !(try fileContains(GPU_CONF, driver_expect, app.allocator))) {
                 vr.ok = false;
                 vr.warnings += 1;
-                try appendWarning(app, "managed GPU config does not pin the expected GPU BusID", .{});
+                try appendWarning(app, "managed GPU config does not contain the expected Xorg driver selection", .{});
+            }
+            if (app.hw.gpu_hybrid and hwPrimaryBus(app.hw).len > 0 and
+                !std.mem.eql(u8, driver, "scfb") and !std.mem.eql(u8, driver, "vesa")) {
+                const bus_expect = try std.fmt.allocPrint(app.allocator, "BusID \"{s}\"", .{hwPrimaryBus(app.hw)});
+                defer app.allocator.free(bus_expect);
+                if (!(try fileContains(GPU_CONF, bus_expect, app.allocator))) {
+                    vr.ok = false;
+                    vr.warnings += 1;
+                    try appendWarning(app, "managed GPU config does not pin the expected GPU BusID", .{});
+                }
             }
         }
     }
